@@ -96,6 +96,10 @@ fn clean_wav(raw: &[u8]) -> Vec<u8> {
     out
 }
 
+pub fn synthesize_wav(voice: &VoiceModel, text: &str) -> Result<Vec<u8>> {
+    synthesize(voice, text)
+}
+
 pub fn speak(voice: &VoiceModel, _voice_name: &str, text: &str, _speed: f32) -> Result<()> {
     let wav = synthesize(voice, text)?;
     if wav.is_empty() {

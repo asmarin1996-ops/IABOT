@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+﻿use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -65,6 +65,11 @@ fn handle_connection(stream: mio::net::TcpStream, hub: WebHub) {
         return;
     }
 
+    if method == "GET" && (path == "/api/speak.wav" || path.starts_with("/api/speak.wav?")) {
+        handle_speak_wav(&mut s, path.as_str());
+        return;
+    }
+
     if method == "GET" && path.starts_with("/api/") {
         handle_get_api(&mut s, path.as_str(), hub);
         return;
@@ -76,6 +81,40 @@ fn handle_connection(stream: mio::net::TcpStream, hub: WebHub) {
     }
 
     send_json(&mut s, 404, "{\"error\":\"no encontrado\"}");
+}
+
+fn handle_speak_wav(s: &mut mio::net::TcpStream, path: &str) {
+    let text = if let Some(q) = path.split('?').nth(1) {
+        let raw: String = q
+            .split('&')
+            .map(|kv| {
+                let mut it = kv.splitn(2, '=');
+                let key = it.next().unwrap_or("");
+                let val = it.next().unwrap_or("");
+                if key == "text" {
+                    val
+                } else {
+                    ""
+                }
+            })
+            .collect();
+        percent_decode(&raw)
+    } else {
+        String::new()
+    };
+    if text.is_empty() {
+        send_json(s, 400, "{\"error\":\"texto vacio\"}");
+        return;
+    }
+    match synth_text(&text) {
+        Ok(wav) => {
+            send_http(s, 200, "audio/wav", &wav);
+            println!("OK speak.wav: {} bytes, txt={}", wav.len(), text);
+        }
+        Err(e) => {
+            send_json(s, 500, &format!("{{\"error\":\"voz no disponible: {}\"}}", e));
+        }
+    }
 }
 
 fn handle_get_api(s: &mut mio::net::TcpStream, path: &str, hub: WebHub) {
@@ -190,14 +229,18 @@ fn split_request(request: &str) -> (String, String, String) {
 fn read_request(s: &mut mio::net::TcpStream) -> String {
     let mut buf: Vec<u8> = Vec::new();
     let mut attempts = 0;
+    let mut need: usize = 0;
 
     loop {
         attempts += 1;
-        if attempts > 200 {
+        if attempts > 1500 {
+            break;
+        }
+        if need > 0 && buf.len() >= need {
             break;
         }
 
-        let mut chunk = [0u8; 2048];
+        let mut chunk = [0u8; 4096];
         let n = read_some(s, &mut chunk);
 
         match n {
@@ -207,8 +250,14 @@ fn read_request(s: &mut mio::net::TcpStream) -> String {
             }
             Some(len) => {
                 buf.extend(&chunk[..len]);
-                if headers_complete(&buf) {
-                    break;
+                if need == 0 {
+                    if let Some(hdr_end) = find_header_end(&buf) {
+                        let body_len = content_length(&buf[..hdr_end]);
+                        need = hdr_end + 4 + body_len;
+                        if buf.len() >= need {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -218,6 +267,27 @@ fn read_request(s: &mut mio::net::TcpStream) -> String {
         return String::new();
     }
     String::from_utf8_lossy(&buf).to_string()
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i + 3 < buf.len() {
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn content_length(head: &[u8]) -> usize {
+    let text = String::from_utf8_lossy(head).to_lowercase();
+    for line in text.split("\r\n") {
+        if let Some(val) = line.strip_prefix("content-length:") {
+            return val.trim().parse::<usize>().unwrap_or(0);
+        }
+    }
+    0
 }
 
 fn read_some(s: &mut mio::net::TcpStream, buf: &mut [u8]) -> Option<usize> {
@@ -230,20 +300,6 @@ fn read_some(s: &mut mio::net::TcpStream, buf: &mut [u8]) -> Option<usize> {
             Err(_) => return None,
         }
     }
-}
-
-fn headers_complete(buf: &[u8]) -> bool {
-    if buf.len() < 4 {
-        return false;
-    }
-    let mut i = 0;
-    while i + 3 < buf.len() {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
-            return true;
-        }
-        i += 1;
-    }
-    false
 }
 
 fn send_http(s: &mut mio::net::TcpStream, code: u16, ctype: &str, body: &[u8]) {
@@ -263,6 +319,54 @@ fn send_http(s: &mut mio::net::TcpStream, code: u16, ctype: &str, body: &[u8]) {
 
 fn send_json(s: &mut mio::net::TcpStream, code: u16, body: &str) {
     send_http(s, code, "application/json; charset=utf-8", body.as_bytes());
+}
+
+fn synth_text(text: &str) -> Result<Vec<u8>, String> {
+    let voice = get_voice_model()?;
+    crate::voice::synthesize_wav(&voice, text).map_err(|e| format!("{}", e))
+}
+
+fn get_voice_model() -> Result<std::sync::Arc<crate::voice::VoiceModel>, String> {
+    static VOICE: std::sync::OnceLock<
+        std::sync::Mutex<Option<std::sync::Arc<crate::voice::VoiceModel>>>,
+    > = std::sync::OnceLock::new();
+    let cell = VOICE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Some(m) = cell.lock().unwrap().clone() {
+        return Ok(m);
+    }
+    let m = std::sync::Arc::new(
+        crate::voice::build_voice().map_err(|e| e.to_string())?,
+    );
+    let _ = cell.lock().unwrap().replace(m.clone());
+    println!("Voz Piper cargada para el dashboard web");
+    Ok(m)
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn write_all(s: &mut mio::net::TcpStream, data: &[u8]) {
@@ -435,6 +539,7 @@ const DASHBOARD_HTML: &str = r###"
 
 <script>
 let wake = '';
+let lastMsg = '';
 function log(msg){ const c=document.getElementById('chat'); c.textContent += msg+'\n'; c.scrollTop=c.scrollHeight; }
 function jstr(s){ return JSON.stringify(s); }
 function cmd(c){ enviarTexto(wake + ' ' + c); }
@@ -476,7 +581,13 @@ async function refresh(){
     for(const k in d.sensores){ const v=d.sensores[k]; sh+='<div class="sensorrow"><span>'+k+'</span><div class="barw"><div class="barf" style="width:'+(v*100)+'%"></div></div><span>'+Math.round(v*100)+'%</span></div>'; }
     document.getElementById('sensores').innerHTML = sh;
     // mensaje del robot
-    if(d.mensaje && d.mensaje.length){ log(d.mensaje); }
+    if(d.mensaje && d.mensaje.length){
+      log(d.mensaje);
+      if(document.getElementById('voz_activa').checked && d.mensaje!==lastMsg){
+        lastMsg=d.mensaje;
+        playWavText(d.mensaje);
+      }
+    }
   }catch(e){}
 }
 async function cargarConfig(){
@@ -504,9 +615,20 @@ async function guardarVoz(){
 async function probarVoz(){
   const t=document.getElementById('voz_texto').value || 'Hola, soy tu robot, probando mi voz.';
   document.getElementById('voz_estado').textContent='sintetizando...';
-  const r=await fetch('/api/speak',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})});
-  const d=await r.json();
-  document.getElementById('voz_estado').textContent = d.hablando ? 'hablando' : 'error';
+  const ok=await playWavText(t);
+  document.getElementById('voz_estado').textContent = ok ? 'hablando' : 'error';
+  if(ok) setTimeout(function(){ document.getElementById('voz_estado').textContent=''; },4000);
+}
+async function playWavText(t){
+  try{
+    const r=await fetch('/api/speak.wav?text='+encodeURIComponent(t));
+    if(!r.ok) return false;
+    const blob=await r.blob();
+    const u=URL.createObjectURL(blob);
+    const a=new Audio(u);
+    await a.play();
+    return true;
+  }catch(e){ return false; }
 }
 setInterval(refresh, 1200);
 refresh(); cargarConfig();
