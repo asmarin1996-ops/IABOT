@@ -1,0 +1,24 @@
+[package]
+name = "synapse-cli"
+version.workspace = true
+edition.workspace = true
+description = "CLI interactiva para SynapseAI"
+
+[[bin]]
+name = "synapse"
+path = "src/main.rs"
+
+[dependencies]
+synapse-core = { path = "../synapse-core" }
+synapse-memory = { path = "../synapse-memory" }
+synapse-consciousness = { path = "../synapse-consciousness" }
+synapse-hal = { path = "../synapse-hal" }
+synapse-sim = { path = "../synapse-sim" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+env_logger.workspace = true
+log.workspace = true
+toml.workspace = true
+chrono.workspace = true

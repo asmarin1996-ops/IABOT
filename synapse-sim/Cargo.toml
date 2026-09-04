@@ -1,0 +1,14 @@
+[package]
+name = "synapse-sim"
+version.workspace = true
+edition.workspace = true
+description = "Simulador virtual para testing en PC"
+
+[dependencies]
+synapse-core = { path = "../synapse-core" }
+synapse-hal = { path = "../synapse-hal" }
+serde.workspace = true
+rand.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true

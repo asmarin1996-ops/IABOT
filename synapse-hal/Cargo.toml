@@ -1,0 +1,14 @@
+[package]
+name = "synapse-hal"
+version.workspace = true
+edition.workspace = true
+description = "Hardware Abstraction Layer para SynapseAI"
+
+[dependencies]
+synapse-core = { path = "../synapse-core" }
+serde.workspace = true
+rand.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true

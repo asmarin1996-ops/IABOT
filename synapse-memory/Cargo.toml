@@ -1,0 +1,15 @@
+[package]
+name = "synapse-memory"
+version.workspace = true
+edition.workspace = true
+description = "Memoria persistente para SynapseAI"
+
+[dependencies]
+synapse-core = { path = "../synapse-core" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true

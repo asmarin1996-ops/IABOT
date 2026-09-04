@@ -1,0 +1,15 @@
+[package]
+name = "synapse-consciousness"
+version.workspace = true
+edition.workspace = true
+description = "Modulo de conciencia y auto-monitoreo para SynapseAI"
+
+[dependencies]
+synapse-core = { path = "../synapse-core" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+rand.workspace = true
