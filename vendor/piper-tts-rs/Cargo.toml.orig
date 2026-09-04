@@ -1,0 +1,39 @@
+[package]
+name = "piper-tts-rs"
+version = "0.1.4"
+edition = "2024"
+exclude = [
+    "../samples/*",
+    "../examples/*"
+]
+
+authors = ["Pulatov Kamran"]
+description = "Piper-TTS implementation in Rust"
+license-file = "../COPYRIGHT.md"
+readme = "../README.md"
+homepage = "https://github.com/WrldEngine/piper-tts-rs"
+repository = "https://github.com/WrldEngine/piper-tts-rs"
+
+[dependencies]
+piper-tts-rs-sys = { workspace = true }
+anyhow = "1.0"
+hound = "3.5.1"
+
+[features]
+default = ["cpu"]
+cuda = ["piper-tts-rs-sys/cuda"]
+cpu = ["piper-tts-rs-sys/cpu"]
+
+[[example]]
+name = "simple"
+path = "../examples/simple.rs"
+crate-type = ["bin"]
+
+[[example]]
+name = "simple_native"
+path = "../examples/simple_native.rs"
+crate-type = ["bin"]
+
+[[test]]
+name = "piper_safe_test"
+path = "../tests/piper_safe_test.rs"

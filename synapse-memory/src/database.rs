@@ -65,9 +65,53 @@ impl MemoryDatabase {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             ",
         )?;
         Ok(())
+    }
+
+    pub fn get_config(&self, key: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM config WHERE key = ?1")?;
+
+        let result = stmt
+            .query_row(params![key], |row| {
+                let val: String = row.get(0)?;
+                Ok(val)
+            })
+            .optional()?;
+
+        Ok(result)
+    }
+
+    pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO config (key, value, updated_at)
+             VALUES (?1, ?2, datetime('now'))",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_all_config(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT key, value FROM config")?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let key: String = row.get(0)?;
+                let val: String = row.get(1)?;
+                Ok((key, val))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows)
     }
 
     pub fn store_experience(

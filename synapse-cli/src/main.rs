@@ -2,7 +2,13 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::io::{self, Write};
 
-use synapse_core::brain::Brain;
+mod commands;
+mod voice;
+mod web;
+
+use commands::parse_web_command;
+use commands::WebCommand;
+use synapse_core::brain::{Action, Brain};
 use synapse_core::learning::{LearningEngine, Reward};
 use synapse_core::state::AgentState;
 use synapse_consciousness::adaptation::AdaptationEngine;
@@ -32,6 +38,11 @@ struct SynapseMind {
     agent_state: AgentState,
     episode: u64,
     total_goals: u64,
+    name: String,
+    wake_word: String,
+    paused: bool,
+    last_message: String,
+    last_wake_at: std::time::Instant,
 }
 
 impl SynapseMind {
@@ -64,6 +75,15 @@ impl SynapseMind {
 
         let world = World::new_empty(12, 8);
 
+        let name = match memory_db.get_config("nombre")? {
+            Some(v) => v,
+            None => "synapse".to_string(),
+        };
+        let wake_word = match memory_db.get_config("activacion")? {
+            Some(v) => v,
+            None => "synapse".to_string(),
+        };
+
         Ok(Self {
             brain: Brain::new(8, 4),
             learning: LearningEngine::new(),
@@ -78,10 +98,19 @@ impl SynapseMind {
             agent_state: AgentState::new(),
             episode: 0,
             total_goals: 0,
+            name,
+            wake_word,
+            paused: false,
+            last_message: "Listo para aprender.".to_string(),
+            last_wake_at: std::time::Instant::now(),
         })
     }
 
     fn run_step(&mut self) -> Result<bool> {
+        self.run_step_impl(None)
+    }
+
+    fn run_step_impl(&mut self, forced: Option<Action>) -> Result<bool> {
         self.monitor.update_uptime();
 
         let readings = self.world.sensor_readings();
@@ -98,7 +127,10 @@ impl SynapseMind {
 
         let state_features = self.build_state_features(&readings);
 
-        let action = self.brain.decide(&synapse_core::brain::State::new(state_features.clone()));
+        let action = match forced {
+            Some(a) => a,
+            None => self.brain.decide(&synapse_core::brain::State::new(state_features.clone())),
+        };
 
         let actuator_cmd = match action {
             synapse_core::brain::Action::Forward => {
@@ -237,6 +269,165 @@ impl SynapseMind {
         features
     }
 
+    fn actuator_cmd_for(action: Action) -> synapse_hal::actuator::ActuatorCommand {
+        match action {
+            Action::Forward => synapse_hal::actuator::ActuatorCommand::MoveForward(0.5),
+            Action::Backward => synapse_hal::actuator::ActuatorCommand::MoveBackward(0.5),
+            Action::TurnLeft => synapse_hal::actuator::ActuatorCommand::TurnLeft(30.0),
+            Action::TurnRight => synapse_hal::actuator::ActuatorCommand::TurnRight(30.0),
+            Action::Stop | Action::Custom(_) => synapse_hal::actuator::ActuatorCommand::Stop,
+        }
+    }
+
+    fn apply_action(&mut self, action: Action) {
+        self.actuators.execute_all(Self::actuator_cmd_for(action));
+        self.robot.execute_action(action, &mut self.world);
+    }
+
+    fn process_message(&mut self, msg: &str) -> String {
+        let latch_seconds: u64 = 10;
+        let grace_active = self.last_wake_at.elapsed().as_secs() < latch_seconds;
+        let command = parse_web_command(msg, &self.wake_word, grace_active);
+
+        let wake_lower = self.wake_word.trim().to_lowercase();
+        let msg_lower = msg.trim().to_lowercase();
+        let used_wake = !wake_lower.is_empty() && msg_lower.contains(&wake_lower);
+        if used_wake {
+            self.last_wake_at = std::time::Instant::now();
+        }
+
+        match command {
+            WebCommand::Ignore => {
+                return "Estoy esperando mi palabra de activacion.".to_string();
+            }
+            WebCommand::Greeting => {
+                return format!("Hola! Soy {}. En que te ayudo?", self.name);
+            }
+            WebCommand::Action(a) => {
+                self.apply_action(a);
+                return "Orden recibida.".to_string();
+            }
+            WebCommand::Pause => {
+                self.paused = true;
+                return "Pausado.".to_string();
+            }
+            WebCommand::Resume => {
+                self.paused = false;
+                return "Reanudado.".to_string();
+            }
+            WebCommand::Train(n) => {
+                let _r = self.run_training(n);
+                return format!("Entrenamiento de {} episodios terminado.", n);
+            }
+            WebCommand::SetName(v) => {
+                self.set_name(v.as_str());
+                return format!("Mi nombre ahora es {}", self.name);
+            }
+            WebCommand::SetWakeWord(v) => {
+                self.set_wake_word(v.as_str());
+                return format!("Palabra de activacion cambiada a '{}'", self.wake_word);
+            }
+            WebCommand::DoStatus => {
+                return format!(
+                    "Episodio {}, metas {}, posicion {:?}, emocion {}",
+                    self.episode, self.total_goals, self.robot.state.position,
+                    self.emotion.dominant_emotion(),
+                );
+            }
+            WebCommand::DoDiagnostic => {
+                return format!(
+                    "Salud {:.0}%, errores {}, sensores {}",
+                    self.monitor.overall_health_score() * 100.0,
+                    self.monitor.health.errors_count,
+                    self.monitor.health.sensor_status.len(),
+                );
+            }
+            WebCommand::Help => {
+                return format!(
+                    "Puedes decirme: adelante, atras, izquierda, derecha, stop, pausa, reanudar, estado, diagnostico, entrenar <n>, nombre <x>, activacion <x>"
+                );
+            }
+            WebCommand::Unknown => {
+                return "No entiendo esa orden. Escribe 'ayuda' para ver las opciones.".to_string();
+            }
+        }
+    }
+
+    fn set_name(&mut self, value: &str) {
+        self.name = value.to_string();
+        let _ = self.memory_db.set_config("nombre", value);
+    }
+
+    fn set_wake_word(&mut self, value: &str) {
+        let clean = value.trim().split_whitespace().next().unwrap_or_default();
+        self.wake_word = clean.to_string();
+        let _ = self.memory_db.set_config("activacion", clean);
+    }
+
+    fn status_json(&self) -> String {
+        let mut sensor_map = String::new();
+        let sensors = self.world.sensor_readings();
+        let mut first = true;
+        sensor_map.push('{');
+        for (name, value) in &sensors {
+            if !first {
+                sensor_map.push(',');
+            }
+            first = false;
+            sensor_map.push_str(&format!("\"{}\":{}", name, value));
+        }
+        sensor_map.push('}');
+
+        let emoji = match self.emotion.dominant_emotion() {
+            "confianza" => "^_^",
+            "curiosidad" => "(?_?)",
+            "estres" => ">_<",
+            "satisfaccion" => ":-)",
+            "cautela" => "(_o_)",
+            _ => "-_-",
+        };
+
+        format!(
+            "{{\"nombre\":\"{}\",\"activacion\":\"{}\",\"emocion\":\"{}\",\"emoji\":\"{}\",\"confianza\":{},\"estres\":{},\"energia\":{},\"curiosidad\":{},\"explotacion\":{},\"explotar\":{},\"episodio\":{},\"total_metas\":{},\"posicion\":\"({}, {})\",\"estados\":{},\"experiencias\":{},\"adaptaciones\":{},\"recompensa\":{},\"mundo\":\"{}\",\"sensores\":{},\"mensaje\":\"{}\"}}",
+            self.name,
+            self.wake_word,
+            self.emotion.dominant_emotion(),
+            emoji,
+            self.emotion.confidence,
+            self.emotion.stress,
+            self.emotion.energy_level,
+            self.emotion.curiosity,
+            self.brain.q_table.exploration_rate,
+            self.brain.q_table.exploration_rate,
+            self.episode,
+            self.total_goals,
+            self.world.robot_pos.0,
+            self.world.robot_pos.1,
+            self.brain.q_table.num_states(),
+            self.learning.experiences.len(),
+            self.adaptation.total_adaptations,
+            self.learning.total_reward,
+            Self::json_escape_multi(&AsciiRenderer::render_world(&self.world)),
+            sensor_map,
+            Self::json_escape_multi(&self.last_message),
+        )
+    }
+
+    fn json_escape_multi(s: &str) -> String {
+        let mut out = String::new();
+        for ch in s.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                _ => out.push(ch),
+            }
+        }
+        out
+    }
+
     fn run_training(&mut self, max_episodes: u64) -> Result<()> {
         println!("=== SynapseAI - Entrenamiento ===");
         println!("Episodios maximos: {}", max_episodes);
@@ -354,6 +545,114 @@ impl SynapseMind {
 
         Ok(())
     }
+
+    fn run_web(&mut self, port: u16) -> Result<()> {
+        println!("=== SynapseAI - Modo Web ===");
+        println!("Nombre: {} | Palabra de activacion: {}", self.name, self.wake_word);
+        println!("Presiona Ctrl+C para detener.");
+
+        let hub = web::make_hub(&self.name, &self.wake_word);
+        let hub_server = hub.clone();
+
+        std::thread::spawn(move || {
+            web::run_api_server(port, hub_server);
+        });
+
+        let voice_holder: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<voice::VoiceModel>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let voice_load = voice_holder.clone();
+        let hub_for_voice = hub.clone();
+        std::thread::spawn(move || {
+            match voice::build_voice() {
+                Ok(model) => {
+                    let voices = model.voices.clone();
+                    {
+                        let mut g = hub_for_voice.lock().unwrap();
+                        g.voices = voices;
+                    }
+                    *voice_load.lock().unwrap() = Some(std::sync::Arc::new(model));
+                }
+                Err(e) => {
+                    eprintln!("No se pudo cargar el modelo de voz: {}", e);
+                }
+            }
+        });
+
+        loop {
+            self.refresh_status(&hub);
+
+            let mut processed = 0;
+            loop {
+                if processed >= 10 {
+                    break;
+                }
+                let next = hub.lock().unwrap().commands.pop_front();
+                if next.is_none() {
+                    break;
+                }
+                processed += 1;
+                let msg = next.unwrap();
+                let response = self.process_message(msg.as_str());
+                self.last_message = response.clone();
+                self.speak_response(&hub, &voice_holder, &response);
+            }
+            let _ = processed;
+
+            loop {
+                let next = hub.lock().unwrap().speak_requests.pop_front();
+                if next.is_none() {
+                    break;
+                }
+                self.speak_response(&hub, &voice_holder, &next.unwrap());
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn speak_response(
+        &self,
+        hub: &web::WebHub,
+        holder: &std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<voice::VoiceModel>>>>,
+        text: &str,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let (enabled, vname) = {
+            let g = hub.lock().unwrap();
+            (g.voice_enabled, g.voice_name.clone())
+        };
+        if !enabled {
+            return;
+        }
+        let model = holder.lock().unwrap().clone();
+        if model.is_none() {
+            return;
+        }
+        let model = model.unwrap();
+        let spoken = text.to_string();
+        std::thread::spawn(move || {
+            let _ = voice::speak(&model, &vname, &spoken, 1.0);
+        });
+    }
+
+    fn refresh_status(&mut self, hub: &web::WebHub) {
+        self.monitor.update_uptime();
+
+        let readings = self.world.sensor_readings();
+        for (name, _value) in &readings {
+            if let Some((v, _)) = self.sensors.get_reading(name) {
+                self.monitor.record_sensor_reading(name, v, 0.1);
+            }
+        }
+
+        let status = self.status_json();
+        let mut guard = hub.lock().unwrap();
+        guard.name = self.name.to_string();
+        guard.wake_word = self.wake_word.to_string();
+        guard.status = status;
+    }
 }
 
 fn print_banner() {
@@ -381,6 +680,66 @@ fn main() -> Result<()> {
         Some("demo") => {
             println!("Modo demo: ejecutando 100 episodios...\n");
             mind.run_training(100)?;
+        }
+        Some("web") => {
+            let port = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8080);
+            mind.run_web(port)?;
+        }
+        Some("speak") => {
+            let text = args.get(2).cloned().unwrap_or_default();
+            if text.is_empty() {
+                println!("Uso: synapse speak \"texto a decir\" [--voice Bella] [--wav salida.wav] [--speed 1.0]");
+                return Ok(());
+            }
+
+            let mut voice_name = voice::DEFAULT_VOICE.to_string();
+            let mut speed = 1.0f32;
+            let mut wav_path: Option<String> = None;
+
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--voice" => {
+                        if i + 1 < args.len() {
+                            voice_name = args[i + 1].clone();
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    "--speed" => {
+                        if i + 1 < args.len() {
+                            speed = args[i + 1].parse().unwrap_or(1.0);
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    "--wav" => {
+                        if i + 1 < args.len() {
+                            wav_path = Some(args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+
+            println!("Cargando modelo de voz (primera vez descarga, luego offline)...");
+            let model = voice::build_voice().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            println!("Voces disponibles: {:?}", model.voices);
+            println!("Voz: {} | Velocidad: {}", voice_name, speed);
+
+            if let Some(wav) = &wav_path {
+                voice::write_wav(&model, &voice_name, &text, speed, std::path::Path::new(wav))?;
+                println!("Audio guardado en {}", wav);
+            } else {
+                println!("Hablando: {:?}", text);
+                voice::speak(&model, &voice_name, &text, speed)?;
+                println!("Listo.");
+            }
         }
         _ => {
             mind.run_interactive()?;

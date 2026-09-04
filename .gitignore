@@ -2,3 +2,10 @@
 **/*.rs.bk
 synapse_memory.db
 Cargo.lock
+# Artefactos que cmake descarga/construye (onnxruntime, espeak-ng, install)
+vendor/**/libpiper/lib/
+vendor/**/libpiper/install/
+vendor/**/libpiper/download/
+vendor/**/libpiper-cuda/lib/
+vendor/**/libpiper-cuda/install/
+vendor/**/libpiper-cuda/download/
