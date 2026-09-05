@@ -17,6 +17,8 @@ pub enum WebCommand {
     Think(String),
     SetBrain(bool),
     MoveServo(String, f64), // nombre del actuador, angulo en grados
+    QueVes,
+    Escucha,
     Unknown,
 }
 
@@ -61,6 +63,23 @@ pub fn parse_web_command(input: &str, wake_word: &str, grace_active: bool) -> We
                 return WebCommand::MoveServo(servo.to_string(), ang as f64);
             }
         }
+    }
+
+    // PERCEPCION: ver y escuchar
+    if contains_any(
+        &detect,
+        &[
+            "que ves", "que veo", "ves algo", "que miras", "que estas viendo",
+            "que esta viendo", "que se ve", "como se ve", "camara", "vista",
+        ],
+    ) {
+        return WebCommand::QueVes;
+    }
+    if contains_any(
+        &detect,
+        &["escucha", "escuchar", "que oyes", "que oigo", "oyes algo", "que se escucha", "microfono", "audio"],
+    ) {
+        return WebCommand::Escucha;
     }
 
     // ORDEN DE MOVIMIENTO

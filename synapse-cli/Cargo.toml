@@ -8,6 +8,8 @@ description = "CLI interactiva para SynapseAI"
 default = []
 # Cuerpo fisico: actuadores reales para Raspberry Pi (servos PCA9685 + motores DC)
 rpi = ["synapse-hal/rpi"]
+# Percepcion real (camara V4L2 + microfono ALSA) para Raspberry Pi
+percepcion_real = ["synapse-hal/percepcion_real"]
 
 [[bin]]
 name = "synapse"

@@ -8,6 +8,8 @@ description = "Hardware Abstraction Layer para SynapseAI"
 default = []
 # Actuadores fisicos para Raspberry Pi (servos via PCA9685/I2C y motores DC via GPIO PWM)
 rpi = ["dep:rppal"]
+# Percepcion con hardware real: camara V4L2 (Linux) y microfono ALSA
+percepcion_real = ["dep:v4l", "dep:alsa"]
 
 [dependencies]
 synapse-core = { path = "../synapse-core" }
@@ -18,3 +20,5 @@ anyhow.workspace = true
 thiserror.workspace = true
 log.workspace = true
 rppal = { version = "0.19", optional = true }
+v4l = { version = "0.14", optional = true }
+alsa = { version = "0.9", optional = true }

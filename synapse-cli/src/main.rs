@@ -19,6 +19,7 @@ use synapse_hal::virtual_actuator::VirtualActuator;
 use synapse_hal::virtual_sensor::VirtualSensor;
 use synapse_hal::sensor::SensorArray;
 use synapse_hal::actuator::ActuatorArray;
+use synapse_hal::percepcion::{Percepcion, PercepcionVirtual, Vista, Oido};
 use synapse_memory::database::MemoryDatabase;
 use synapse_memory::recall::RecallEngine;
 use synapse_sim::world::World;
@@ -48,6 +49,11 @@ struct SynapseMind {
     world: World,
     sensors: SensorArray,
     actuators: ActuatorArray,
+    percepcion: Box<dyn Percepcion>,
+    vista: Vista,
+    oido: Oido,
+    last_vision_at: std::time::Instant,
+    last_audio_at: std::time::Instant,
     memory_db: MemoryDatabase,
     agent_state: AgentState,
     episode: u64,
@@ -88,6 +94,25 @@ fn register_cuerpo(actuators: &mut ActuatorArray) {
     actuators.add(Box::new(VirtualActuator::new("servo_cabezal")));
 }
 
+/// Registra los "sentidos" de susana. Sin hardware (VM) usa backends virtuales,
+/// triviales en recursos; en una Raspberry Pi usa camara V4L2 y microfono ALSA.
+#[cfg(feature = "percepcion_real")]
+fn registrar_percepcion() -> Box<dyn Percepcion> {
+    use synapse_hal::percepcion::PercepcionReal;
+    use synapse_hal::rpi_actuator::is_raspberry_pi;
+    if is_raspberry_pi() {
+        log::info!("sentidos reales: camara V4L2 + microfono ALSA");
+        Box::new(PercepcionReal::new())
+    } else {
+        Box::new(PercepcionVirtual::new())
+    }
+}
+
+#[cfg(not(feature = "percepcion_real"))]
+fn registrar_percepcion() -> Box<dyn Percepcion> {
+    Box::new(PercepcionVirtual::new())
+}
+
 impl SynapseMind {
     fn new() -> Result<Self> {
         let memory_path = PathBuf::from("synapse_memory.db");
@@ -106,6 +131,23 @@ impl SynapseMind {
 
         let mut actuators = ActuatorArray::new();
         register_cuerpo(&mut actuators);
+
+        let vista = Vista {
+            fuente: "inicial".to_string(),
+            ancho: 0,
+            alto: 0,
+            brillo: 0.5,
+            movimiento: 0.0,
+            texto: "Todavia no he mirado.".to_string(),
+        };
+        let oido = Oido {
+            fuente: "inicial".to_string(),
+            nivel: 0.0,
+            voz: false,
+            duracion_ms: 0,
+            texto: "Todavia no he escuchado.".to_string(),
+        };
+        let hace_rato = std::time::Instant::now() - std::time::Duration::from_secs(3600);
 
         let mut monitor = SelfMonitor::new();
         monitor.register_sensor("ultrasonido_frontal");
@@ -193,6 +235,11 @@ impl SynapseMind {
             world,
             sensors,
             actuators,
+            percepcion: registrar_percepcion(),
+            vista,
+            oido,
+            last_vision_at: hace_rato,
+            last_audio_at: hace_rato,
             memory_db,
             agent_state: AgentState::new(),
             episode: 0,
@@ -393,6 +440,25 @@ impl SynapseMind {
         self.robot.execute_action(action, &mut self.world);
     }
 
+    fn memoria_baja(&self, umbral_mb: u64) -> bool {
+        free_memory_mb().map(|libre| libre < umbral_mb).unwrap_or(false)
+    }
+
+    fn percepcion_hints(&mut self) -> (f64, f64) {
+        let lecturas = self.sensors.read_all();
+        let brillo = lecturas
+            .iter()
+            .find(|(n, _, _)| n == "luz")
+            .map(|(_, v, _)| *v)
+            .unwrap_or(0.5);
+        let mov = lecturas
+            .iter()
+            .find(|(n, _, _)| n == "ultrasonido_frontal")
+            .map(|(_, v, _)| *v)
+            .unwrap_or(0.0);
+        (brillo.clamp(0.0, 1.0), mov.clamp(0.0, 1.0))
+    }
+
     fn process_message(&mut self, msg: &str) -> String {
         let latch_seconds: u64 = 10;
         let grace_active = self.last_wake_at.elapsed().as_secs() < latch_seconds;
@@ -452,10 +518,12 @@ impl SynapseMind {
                 }
             }
             WebCommand::DoStatus => {
+                let vista = format!("brillo {:.0}%", self.vista.brillo * 100.0);
+                let oido = format!("nivel {:.0}%", self.oido.nivel * 100.0);
                 return format!(
-                    "Episodio {}, metas {}, posicion {:?}, emocion {}",
+                    "Episodio {}, metas {}, posicion {:?}, emocion {} | veo: {} | oigo: {}",
                     self.episode, self.total_goals, self.robot.state.position,
-                    self.emotion.dominant_emotion(),
+                    self.emotion.dominant_emotion(), vista, oido,
                 );
             }
             WebCommand::DoDiagnostic => {
@@ -535,6 +603,31 @@ impl SynapseMind {
                     return format!("El servo {} no está conectado en este momento.", name);
                 }
                 return format!("Moviendo {} a {} grados.", name, angle);
+            }
+            WebCommand::QueVes => {
+                if self.last_vision_at.elapsed() < std::time::Duration::from_secs(5) {
+                    return self.vista.texto.clone();
+                }
+                if self.memoria_baja(300) {
+                    return "Prefiero no encender la camara ahora para no agotar la memoria de la VM."
+                        .to_string();
+                }
+                let (hint_b, hint_m) = self.percepcion_hints();
+                self.vista = self.percepcion.ver(hint_b, hint_m);
+                self.last_vision_at = std::time::Instant::now();
+                return self.vista.texto.clone();
+            }
+            WebCommand::Escucha => {
+                if self.last_audio_at.elapsed() < std::time::Duration::from_secs(3) {
+                    return self.oido.texto.clone();
+                }
+                if self.memoria_baja(300) {
+                    return "Prefiero no activar el microfono ahora para no agotar la memoria de la VM."
+                        .to_string();
+                }
+                self.oido = self.percepcion.oir();
+                self.last_audio_at = std::time::Instant::now();
+                return self.oido.texto.clone();
             }
             WebCommand::Unknown => {
                 let query = query_without_wake(msg, &self.wake_word);
