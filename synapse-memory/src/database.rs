@@ -263,6 +263,20 @@ impl MemoryDatabase {
         Ok(())
     }
 
+    pub fn get_rules(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, value FROM knowledge WHERE category = 'regla' ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let key: String = row.get(0)?;
+                let val: String = row.get(1)?;
+                Ok((key, val))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn delete_config(&self, key: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM config WHERE key = ?1", params![key])?;

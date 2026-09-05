@@ -13,7 +13,9 @@ pub struct WebHubData {
     pub speak_requests: VecDeque<String>,
     pub learn_requests: VecDeque<(String, String)>,
     pub pdf_requests: VecDeque<(String, String)>,
+    pub rules_requests: VecDeque<(String, String)>,
     pub learned_summary: String,
+    pub rules: Vec<String>,
 }
 
 pub type WebHub = Arc<Mutex<WebHubData>>;
@@ -30,7 +32,9 @@ pub fn make_hub(name: &str, wake_word: &str) -> WebHub {
         speak_requests: VecDeque::new(),
         learn_requests: VecDeque::new(),
         pdf_requests: VecDeque::new(),
+        rules_requests: VecDeque::new(),
         learned_summary: String::new(),
+        rules: Vec::new(),
     }))
 }
 
@@ -178,6 +182,17 @@ fn handle_get_api(s: &mut mio::net::TcpStream, path: &str, hub: WebHub) {
             let body = format!("{{\"aprendido\":\"{}\"}}", json_escape(&guard.learned_summary));
             send_json(s, 200, body.as_str());
         }
+        "/api/rules" => {
+            let mut out = String::new();
+            for (i, r) in guard.rules.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&format!("\"{}\"", json_escape(r)));
+            }
+            let body = format!("{{\"reglas\":[{}]}}", out);
+            send_json(s, 200, body.as_str());
+        }
         _ => send_json(s, 404, "{\"error\":\"no encontrado\"}"),
     }
 }
@@ -204,6 +219,19 @@ fn handle_write_api(s: &mut mio::net::TcpStream, path: &str, body: &str, hub: We
         }
         guard.commands.push_back(text);
         send_json(s, 200, "{\"ok\":true,\"recibido\":true}");
+        return;
+    }
+
+    if path == "/api/rules" {
+        let accion = extract_json_string(body, "accion").unwrap_or_default();
+        let texto = extract_json_string(body, "texto").unwrap_or_default();
+        if texto.is_empty() {
+            send_json(s, 400, "{\"error\":\"texto vacio\"}");
+            return;
+        }
+        guard.rules_requests.push_back((accion, texto.clone()));
+        let resp = format!("{{\"ok\":true,\"accion\":\"{}\"}}", json_escape(&texto));
+        send_json(s, 200, resp.as_str());
         return;
     }
 
@@ -702,7 +730,7 @@ const DASHBOARD_HTML: &str = r###"
 <style>
   :root { --bg:#0d1117; --panel:#161b22; --f:#e6edf3; --acc:#58a6ff; --ok:#3fb950; --warn:#d29922; --err:#f85149; }
   * { box-sizing:border-box; }
-  body { background:var(--bg); color:var(--f); font-family:monospace; margin:0; padding:16px; }
+  body { background:var(--bg); color:var(--f); font-family:monospace; margin:0; padding:16px 16px 16px 206px; }
   h1 { font-size:18px; margin:0 0 12px; }
   .bar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:14px; }
   .panel { background:var(--panel); border:1px solid #30363d; border-radius:8px; padding:12px; }
@@ -720,6 +748,16 @@ const DASHBOARD_HTML: &str = r###"
   .sensorrow { display:flex; align-items:center; gap:8px; }
   table { border-collapse:collapse; width:100%; }
   td,th { border:1px solid #30363d; padding:4px 8px; font-size:12px; }
+  .tabs { display:flex; flex-direction:column; gap:4px; margin:0; padding:12px 10px; position:fixed; left:0; top:0; bottom:0; width:190px; background:var(--panel); border-right:1px solid #30363d; overflow-y:auto; }
+  .side-brand { font-size:15px; font-weight:bold; color:var(--acc); padding:2px 12px 10px; border-bottom:1px solid #30363d; margin-bottom:8px; }
+  .tab { background:transparent; color:var(--f); border:none; border-left:3px solid transparent; border-radius:6px; text-align:left; padding:10px 12px; font-size:13px; }
+  .tab:hover { background:#21262d; }
+  .tab.act { background:#21262d; border-left-color:var(--acc); color:#ffffff; }
+  .regla { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 8px; border:1px solid #30363d; border-radius:6px; margin-bottom:6px; }
+  .regla span { color:var(--f); }
+  .regla button { color:var(--err); }
+  .sec { margin-top:4px; }
+  @media (max-width:700px){ .tabs{ position:static; width:100%; flex-direction:row; flex-wrap:wrap; border-right:none; border-bottom:1px solid #30363d; margin-bottom:14px; } .side-brand{ display:none; } body{ padding:16px; } }
 </style>
 </head>
 <body>
@@ -733,105 +771,160 @@ const DASHBOARD_HTML: &str = r###"
   <span>Exploracion: <b id="exploracion">-</b></span>
 </div>
 
-<div class="grid">
-  <div class="panel">
-    <h1 style="font-size:14px">MUNDO DEL ROBOT</h1>
-    <pre id="world">cargando...</pre>
-  </div>
+<nav class="tabs">
+  <div class="side-brand">SYNAPSE AI</div>
+  <button class="tab act" onclick="showTab('sec_monitoreo', this)">MONITOREO</button>
+  <button class="tab" onclick="showTab('sec_ordenes', this)">ORDENES</button>
+  <button class="tab" onclick="showTab('sec_conocimiento', this)">CONOCIMIENTO</button>
+  <button class="tab" onclick="showTab('sec_reglas', this)">REGLAS</button>
+  <button class="tab" onclick="showTab('sec_config', this)">CONFIGURACION</button>
+  <button class="tab" onclick="showTab('sec_chat', this)">CHAT</button>
+</nav>
 
-  <div class="panel">
-    <h1 style="font-size:14px">TELEMETRIA</h1>
-    <table>
-      <tr><td>Episodio</td><td><b id="episodio">-</b></td></tr>
-      <tr><td>Metas alcanzadas</td><td><b id="total_metas">-</b></td></tr>
-      <tr><td>Posicion</td><td><b id="posicion">-</b></td></tr>
-      <tr><td>Estado del cerebro</td><td><b id="estados">-</b></td></tr>
-      <tr><td>Experiencias</td><td><b id="experiencias">-</b></td></tr>
-      <tr><td>Adaptaciones</td><td><b id="adaptaciones">-</b></td></tr>
-      <tr><td>Recompensa total</td><td><b id="recompensa">-</b></td></tr>
-    </table>
-  </div>
-
-  <div class="panel">
-    <h1 style="font-size:14px">SENSORES</h1>
-    <div id="sensores">cargando...</div>
-  </div>
-
-  <div class="panel">
-    <h1 style="font-size:14px">ORDENES (palabra de activacion)</h1>
-    <div>
-      <button onclick="cmd('adelante')">Adelante</button>
-      <button onclick="cmd('atras')">Atras</button>
-      <button onclick="cmd('izquierda')">Izquierda</button>
-      <button onclick="cmd('derecha')">Derecha</button>
-      <button onclick="cmd('stop')">Stop</button>
-      <button class="act" onclick="cmd('pausa')">Pausa</button>
-      <button class="act" onclick="cmd('reanudar')">Reanudar</button>
+<section id="sec_monitoreo" class="sec">
+  <div class="grid">
+    <div class="panel">
+      <h1 style="font-size:14px">MUNDO DEL ROBOT</h1>
+      <pre id="world">cargando...</pre>
     </div>
-    <div style="margin-top:8px">
-      <button onclick="cmd('ayuda')">Ayuda</button>
-      <button onclick="cmd('estado')">Estado</button>
-      <button onclick="cmd('diagnostico')">Diagnostico</button>
+
+    <div class="panel">
+      <h1 style="font-size:14px">TELEMETRIA</h1>
+      <table>
+        <tr><td>Episodio</td><td><b id="episodio">-</b></td></tr>
+        <tr><td>Metas alcanzadas</td><td><b id="total_metas">-</b></td></tr>
+        <tr><td>Posicion</td><td><b id="posicion">-</b></td></tr>
+        <tr><td>Estado del cerebro</td><td><b id="estados">-</b></td></tr>
+        <tr><td>Experiencias</td><td><b id="experiencias">-</b></td></tr>
+        <tr><td>Adaptaciones</td><td><b id="adaptaciones">-</b></td></tr>
+        <tr><td>Recompensa total</td><td><b id="recompensa">-</b></td></tr>
+      </table>
     </div>
-    <div style="margin-top:8px">
-      <input id="train_n" type="number" value="50" min="1" style="width:70px" placeholder="n">
-      <button onclick="cmdText('entrenar '+document.getElementById('train_n').value)">Entrenar</button>
+
+    <div class="panel">
+      <h1 style="font-size:14px">SENSORES</h1>
+      <div id="sensores">cargando...</div>
     </div>
   </div>
+</section>
 
-  <div class="panel">
-    <h1 style="font-size:14px">CONFIGURACION</h1>
-    <div style="margin-bottom:6px"><label>Nombre del robot</label>
-      <input id="cfg_nombre" placeholder="nombre"></div>
-    <div style="margin-bottom:6px"><label>Palabra de activacion</label>
-      <input id="cfg_activacion" placeholder="palabra"></div>
-    <button onclick="guardarConfig()">Guardar configuracion</button>
-  </div>
-
-  <div class="panel">
-    <h1 style="font-size:14px">ENSEÑANZA</h1>
-    <div style="margin-bottom:6px">
-      <label>Frase a enseñar</label>
-      <input id="learn_phrase" type="text" placeholder="ej: hola">
+<section id="sec_ordenes" class="sec" hidden>
+  <div class="grid">
+    <div class="panel">
+      <h1 style="font-size:14px">ORDENES (palabra de activacion)</h1>
+      <div>
+        <button onclick="cmd('adelante')">Adelante</button>
+        <button onclick="cmd('atras')">Atras</button>
+        <button onclick="cmd('izquierda')">Izquierda</button>
+        <button onclick="cmd('derecha')">Derecha</button>
+        <button onclick="cmd('stop')">Stop</button>
+        <button class="act" onclick="cmd('pausa')">Pausa</button>
+        <button class="act" onclick="cmd('reanudar')">Reanudar</button>
+      </div>
+      <div style="margin-top:8px">
+        <button onclick="cmd('ayuda')">Ayuda</button>
+        <button onclick="cmd('estado')">Estado</button>
+        <button onclick="cmd('diagnostico')">Diagnostico</button>
+      </div>
+      <div style="margin-top:8px">
+        <input id="train_n" type="number" value="50" min="1" style="width:70px" placeholder="n">
+        <button onclick="cmdText('entrenar '+document.getElementById('train_n').value)">Entrenar</button>
+      </div>
     </div>
-    <div style="margin-bottom:6px">
-      <label>Significado</label>
-      <input id="learn_meaning" type="text" placeholder="ej: saludo">
-    </div>
-    <button onclick="learnRobot()">Enseñar al robot</button>
   </div>
+</section>
 
-  <div class="panel">
-    <h1 style="font-size:14px">SUBIR PDF (material de estudio)</h1>
-    <div style="margin-bottom:6px">
-      <input id="pdf_file" type="file" accept="application/pdf">
+<section id="sec_conocimiento" class="sec" hidden>
+  <div class="grid">
+    <div class="panel">
+      <h1 style="font-size:14px">ENSENANZA</h1>
+      <div style="margin-bottom:6px">
+        <label>Frase a ensenar</label>
+        <input id="learn_phrase" type="text" placeholder="ej: hola">
+      </div>
+      <div style="margin-bottom:6px">
+        <label>Significado</label>
+        <input id="learn_meaning" type="text" placeholder="ej: saludo">
+      </div>
+      <button onclick="learnRobot()">Ensenar al robot</button>
     </div>
-    <button onclick="uploadPDF()">Enviar PDF al robot</button>
-    <div id="pdf_result" style="font-size:12px;color:var(--ok);margin-top:6px"></div>
-  </div>
 
-  <div class="panel">
-    <h1 style="font-size:14px">VOZ (femenina, offline)</h1>
-    <div style="margin-bottom:8px">
-      <label><input type="checkbox" id="voz_activa" checked onchange="guardarVoz()"> Voz activada</label>
+    <div class="panel">
+      <h1 style="font-size:14px">SUBIR PDF (material de estudio)</h1>
+      <div style="margin-bottom:6px">
+        <input id="pdf_file" type="file" accept="application/pdf">
+      </div>
+      <button onclick="uploadPDF()">Enviar PDF al robot</button>
+      <div id="pdf_result" style="font-size:12px;color:var(--ok);margin-top:6px"></div>
     </div>
-    <div style="margin-bottom:8px"><label>Voz</label>
-      <select id="voz_sel" onchange="guardarVoz()"></select></div>
-    <div style="margin-bottom:8px"><label>Texto de prueba</label>
-      <input id="voz_texto" placeholder="Hola, soy tu robot"></div>
-    <button class="act" onclick="probarVoz()">Hablar</button>
-    <span id="voz_estado" style="margin-left:8px;color:var(--ok)"></span>
-  </div>
-</div>
 
-<div class="panel" style="margin-top:14px">
-  <h1 style="font-size:14px">CHAT / MENSAJES</h1>
-  <div class="chat" id="chat"></div>
-  <form onsubmit="enviar(); return false;">
-    <input id="msg" placeholder="Escribe tu orden (ej: synapse adelante)">
-    <button class="act" type="submit">Enviar</button>
-  </form>
-</div>
+    <div class="panel">
+      <h1 style="font-size:14px">MEMORIA</h1>
+      <div style="margin-bottom:8px">
+        <button onclick="cmdText('que sabes')">Que sabes?</button>
+        <button onclick="refreshAprendido()">Refrescar memoria</button>
+      </div>
+      <div class="chat" id="learned_resumen" style="height:120px">cargando...</div>
+    </div>
+  </div>
+</section>
+
+<section id="sec_reglas" class="sec" hidden>
+  <div class="grid">
+    <div class="panel">
+      <h1 style="font-size:14px">REGLAS ABSOLUTAS (no pueden violarse jamas)</h1>
+      <p style="font-size:12px;color:#8b949e;margin:0 0 10px">
+        Escribe una regla que el robot NO pueda cumplir bajo ningun precepto, por ejemplo
+        "nunca te muevas hacia la izquierda" o "no puedes girar a la derecha".
+        Se aplica a los movimientos manuales, a las ordenes del chat y a los movimientos automaticos del entrenamiento.
+      </p>
+      <div style="display:flex;gap:8px;margin-bottom:10px">
+        <input id="regla_texto" placeholder="ej: nunca te muevas hacia la izquierda">
+        <button class="act" onclick="addRegla()">Agregar regla</button>
+      </div>
+      <div id="reglas_lista" style="font-size:12px">Sin reglas registradas.</div>
+    </div>
+  </div>
+</section>
+
+<section id="sec_config" class="sec" hidden>
+  <div class="grid">
+    <div class="panel">
+      <h1 style="font-size:14px">CONFIGURACION</h1>
+      <div style="margin-bottom:6px"><label>Nombre del robot</label>
+        <input id="cfg_nombre" placeholder="nombre"></div>
+      <div style="margin-bottom:6px"><label>Palabra de activacion</label>
+        <input id="cfg_activacion" placeholder="palabra"></div>
+      <button onclick="guardarConfig()">Guardar configuracion</button>
+    </div>
+
+    <div class="panel">
+      <h1 style="font-size:14px">VOZ (femenina, offline)</h1>
+      <div style="margin-bottom:8px">
+        <label><input type="checkbox" id="voz_activa" checked onchange="guardarVoz()"> Voz activada</label>
+      </div>
+      <div style="margin-bottom:8px"><label>Voz</label>
+        <select id="voz_sel" onchange="guardarVoz()"></select></div>
+      <div style="margin-bottom:8px"><label>Texto de prueba</label>
+        <input id="voz_texto" placeholder="Hola, soy tu robot"></div>
+      <button class="act" onclick="probarVoz()">Hablar</button>
+      <span id="voz_estado" style="margin-left:8px;color:var(--ok)"></span>
+    </div>
+  </div>
+</section>
+
+<section id="sec_chat" class="sec" hidden>
+  <div class="grid">
+    <div class="panel">
+      <h1 style="font-size:14px">CHAT / MENSAJES</h1>
+      <div class="chat" id="chat"></div>
+      <form onsubmit="enviar(); return false;">
+        <input id="msg" placeholder="Escribe tu orden (ej: synapse adelante)">
+        <button class="act" type="submit">Enviar</button>
+      </form>
+    </div>
+  </div>
+</section>
 
 <script>
 let wake = '';
@@ -841,6 +934,53 @@ function jstr(s){ return JSON.stringify(s); }
 function cmd(c){ enviarTexto(wake + ' ' + c); }
 function cmdText(t){ enviarTexto(wake + ' ' + t); }
 function enviar(){ const m=document.getElementById('msg').value; enviarTexto(m); document.getElementById('msg').value=''; }
+function showTab(id, btn){
+  document.querySelectorAll('.sec').forEach(function(s){ s.hidden = (s.id !== id); });
+  document.querySelectorAll('.tab').forEach(function(t){ t.classList.remove('act'); });
+  if(btn) btn.classList.add('act');
+  if(id === 'sec_reglas') renderRules();
+  if(id === 'sec_conocimiento') refreshAprendido();
+}
+async function renderRules(){
+  const r = await fetch('/api/rules').then(x=>x.json()).catch(()=>({reglas:[]}));
+  const el = document.getElementById('reglas_lista');
+  el.textContent = '';
+  if(!r.reglas || !r.reglas.length){ el.textContent = 'Sin reglas registradas.'; return; }
+  r.reglas.forEach(function(t, i){
+    const div = document.createElement('div');
+    div.className = 'regla';
+    const span = document.createElement('span');
+    span.textContent = (i+1) + '. ' + t;
+    const btn = document.createElement('button');
+    btn.textContent = 'Quitar';
+    btn.onclick = function(){ quitarRegla(t); };
+    div.appendChild(span);
+    div.appendChild(btn);
+    el.appendChild(div);
+  });
+}
+async function addRegla(){
+  const inp = document.getElementById('regla_texto');
+  const t = inp.value.trim();
+  if(!t) return;
+  const r = await fetch('/api/rules', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({accion:'agregar', texto:t})});
+  const d = await r.json().catch(()=>({}));
+  log('< regla: ' + (d.ok ? t : (d.error||'error')));
+  inp.value = '';
+  renderRules();
+}
+async function quitarRegla(t){
+  await fetch('/api/rules', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({accion:'quitar', texto:t})});
+  renderRules();
+}
+async function refreshAprendido(){
+  try{
+    const r = await fetch('/api/learned'); if(!r.ok) return;
+    const d = await r.json();
+    const el = document.getElementById('learned_resumen');
+    if(el) el.textContent = d.aprendido || 'Sin contenido aun.';
+  }catch(e){}
+}
 async function enviarTexto(t){
   if(!t) return;
   log('> '+t);
@@ -966,7 +1106,7 @@ async function playWavText(t){
   }catch(e){ return false; }
 }
 setInterval(refresh, 1200);
-refresh(); cargarConfig();
+refresh(); cargarConfig(); renderRules(); refreshAprendido();
 </script>
 </body>
 </html>

@@ -33,6 +33,11 @@ struct MemEntry {
     tokens: Vec<String>,
 }
 
+struct Rule {
+    text: String,
+    tokens: Vec<String>,
+}
+
 struct SynapseMind {
     brain: Brain,
     learning: LearningEngine,
@@ -51,6 +56,7 @@ struct SynapseMind {
     wake_word: String,
     knowledge: Vec<MemEntry>,
     token_index: HashMap<String, Vec<usize>>,
+    rules: Vec<Rule>,
     paused: bool,
     last_message: String,
     last_wake_at: std::time::Instant,
@@ -142,6 +148,7 @@ impl SynapseMind {
         }
 
         let knowledge = load_knowledge(&memory_db);
+        let rules = load_rules(&memory_db);
         let mut token_index: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, e) in knowledge.iter().enumerate() {
             if e.tokens.is_empty() {
@@ -170,6 +177,7 @@ impl SynapseMind {
             wake_word,
             knowledge,
             token_index,
+            rules,
             paused: false,
             last_message: "Listo para aprender.".to_string(),
             last_wake_at: std::time::Instant::now(),
@@ -197,10 +205,14 @@ impl SynapseMind {
 
         let state_features = self.build_state_features(&readings);
 
-        let action = match forced {
+        let mut action = match forced {
             Some(a) => a,
             None => self.brain.decide(&synapse_core::brain::State::new(state_features.clone())),
         };
+
+        if self.action_forbidden(action).is_some() {
+            action = synapse_core::brain::Action::Stop;
+        }
 
         let actuator_cmd = match action {
             synapse_core::brain::Action::Forward => {
@@ -366,6 +378,13 @@ impl SynapseMind {
             self.last_wake_at = std::time::Instant::now();
         }
 
+        if let Some(blocked) = self.rule_blocks_command(msg, &command) {
+            return format!(
+                "No puedo hacer eso: tengo una regla absoluta que debo cumplir siempre: '{}'.",
+                blocked
+            );
+        }
+
         match command {
             WebCommand::Ignore => {
                 return "Estoy esperando mi palabra de activacion.".to_string();
@@ -426,7 +445,7 @@ impl SynapseMind {
                 );
             }
             WebCommand::DoKnowledge => {
-                let facts: Vec<&MemEntry> = self.knowledge.iter().filter(|e| e.cat != "material").collect();
+                let facts: Vec<&MemEntry> = self.knowledge.iter().filter(|e| e.cat == "hecho").collect();
                 let mats: Vec<&MemEntry> = self.knowledge.iter().filter(|e| e.cat == "material").collect();
                 if facts.is_empty() && mats.is_empty() {
                     return "Todavia no he aprendido nada. Dime: aprende que X es Y, o sube un PDF.".to_string();
@@ -576,6 +595,142 @@ impl SynapseMind {
             }
         }
         best.map(|(_, i)| &self.knowledge[i])
+    }
+
+    fn add_rule(&mut self, text: &str) -> bool {
+        let clean: String = text
+            .trim()
+            .replace('|', " ")
+            .replace(';', " ")
+            .chars()
+            .map(|c| if c == '\n' { ' ' } else { c })
+            .collect();
+        if clean.trim().is_empty() {
+            return false;
+        }
+        let norm = normalize_key(&clean);
+        if norm.is_empty() {
+            return false;
+        }
+        let tokens = tokenize(&clean);
+        if self
+            .rules
+            .iter()
+            .any(|r| r.tokens == tokens || r.text.eq_ignore_ascii_case(clean.trim()))
+        {
+            return false;
+        }
+        let _ = self
+            .memory_db
+            .store_knowledge(&norm, clean.trim(), Some("regla"), Some("regla"));
+        self.rules.push(Rule {
+            text: clean.trim().to_string(),
+            tokens,
+        });
+        true
+    }
+
+    fn remove_rule(&mut self, key: &str) -> bool {
+        let _ = self.memory_db.delete_knowledge(key);
+        let norm = normalize_key(key);
+        let before = self.rules.len();
+        self.rules
+            .retain(|r| normalize_key(&r.text) != norm && r.text != key);
+        before != self.rules.len()
+    }
+
+    fn shared_token(&self, text: &str) -> Option<String> {
+        let q_tokens = tokenize(text);
+        if q_tokens.is_empty() {
+            return None;
+        }
+        for r in &self.rules {
+            if r.tokens.iter().any(|rt| q_tokens.iter().any(|qt| qt == rt)) {
+                return Some(r.text.clone());
+            }
+        }
+        None
+    }
+
+    fn action_forbidden(&self, action: Action) -> Option<String> {
+        let all = vec![
+            Action::Forward,
+            Action::Backward,
+            Action::TurnLeft,
+            Action::TurnRight,
+        ];
+        for r in &self.rules {
+            let t = r.text.to_lowercase();
+            let has_left = ["izquierda", "izq", "left", "izquierdo"]
+                .iter()
+                .any(|k| t.contains(k));
+            let has_right = ["derecha", "der", "right", "derecho"]
+                .iter()
+                .any(|k| t.contains(k));
+            let has_fwd = ["adelante", "avanza", "avanzar", "forward", "recto", "al frente"]
+                .iter()
+                .any(|k| t.contains(k));
+            let has_back = ["atras", "reversa", "backward", "retrocede", "hacia atras"]
+                .iter()
+                .any(|k| t.contains(k));
+            let has_move = ["moverse", "moverte", "mover", "movimiento", "caminar", "desplazar", "desplazarte", "desplazamiento", "andar", "correr", "corre"]
+                .iter()
+                .any(|k| t.contains(k));
+            let has_turn = ["girar", "gira", "torcer", "torce", "vira", "rota", "rotacion"]
+                .iter()
+                .any(|k| t.contains(k));
+
+            let mut blocked: Vec<Action> = Vec::new();
+            if has_left {
+                blocked.push(Action::TurnLeft);
+            }
+            if has_right {
+                blocked.push(Action::TurnRight);
+            }
+            if has_fwd {
+                blocked.push(Action::Forward);
+            }
+            if has_back {
+                blocked.push(Action::Backward);
+            }
+            if blocked.is_empty() && has_move {
+                blocked = all.clone();
+            }
+            if blocked.is_empty() && has_turn {
+                blocked = vec![Action::TurnLeft, Action::TurnRight];
+            }
+            if blocked.contains(&action) {
+                return Some(r.text.clone());
+            }
+        }
+        None
+    }
+
+    fn rule_blocks_command(&self, text: &str, cmd: &WebCommand) -> Option<String> {
+        match cmd {
+            WebCommand::Action(a) => {
+                if let Some(r) = self.action_forbidden(*a) {
+                    return Some(r);
+                }
+                if let Some(r) = self.shared_token(text) {
+                    return Some(r);
+                }
+                None
+            }
+            WebCommand::Train(_) => {
+                for r in &self.rules {
+                    let t = r.text.to_lowercase();
+                    if ["entrenar", "entrena", "train", "aprendizaje", "adestrar", "educacion"]
+                        .iter()
+                        .any(|k| t.contains(k))
+                    {
+                        return Some(r.text.clone());
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
     }
 
     fn learn_material(&mut self, name: &str, text: &str) -> usize {
@@ -874,6 +1029,27 @@ impl SynapseMind {
                 self.speak_response(&hub, &voice_holder, &response);
             }
 
+            loop {
+                let next = hub.lock().unwrap().rules_requests.pop_front();
+                if next.is_none() {
+                    break;
+                }
+                let (accion, payload) = next.unwrap();
+                let response = if accion == "del" || accion == "quitar" || accion == "eliminar" {
+                    if self.remove_rule(&payload) {
+                        "Regla eliminada.".to_string()
+                    } else {
+                        "No encontre esa regla.".to_string()
+                    }
+                } else if self.add_rule(&payload) {
+                    format!("He registrado la regla absoluta: {}", payload)
+                } else {
+                    "Esa regla ya existe o esta vacia.".to_string()
+                };
+                self.last_message = response.clone();
+                self.speak_response(&hub, &voice_holder, &response);
+            }
+
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
@@ -927,6 +1103,16 @@ impl SynapseMind {
             .map(|e| format!("{} = {}", e.key, e.value))
             .collect::<Vec<_>>()
             .join("; ");
+        guard.rules = self
+            .rules
+            .iter()
+            .map(|r| r.text.clone())
+            .collect::<Vec<_>>();
+        if !guard.learned_summary.is_empty() {
+            guard
+                .learned_summary
+                .push_str(&format!(" | Reglas: {}", self.rules.len()));
+        }
     }
 }
 
@@ -991,6 +1177,19 @@ fn load_knowledge(db: &MemoryDatabase) -> Vec<MemEntry> {
             }
         })
         .filter(|e| !e.tokens.is_empty())
+        .collect()
+}
+
+fn load_rules(db: &MemoryDatabase) -> Vec<Rule> {
+    let rows = match db.get_rules() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    rows.into_iter()
+        .map(|(_key, text)| Rule {
+            tokens: tokenize(&text),
+            text,
+        })
         .collect()
 }
 
