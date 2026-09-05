@@ -59,7 +59,7 @@ fn model_dir() -> PathBuf {
 
 fn synthesize(voice: &VoiceModel, text: &str) -> Result<Vec<u8>> {
     let raw = {
-        let guard = voice.inner.lock().unwrap();
+        let guard = voice.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut raw_buf: Vec<u8> = Vec::new();
         guard
             .0

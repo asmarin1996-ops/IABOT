@@ -52,12 +52,17 @@ pub fn run_api_server(port: u16, hub: WebHub) {
     println!("Dashboard web en http://0.0.0.0:{}", port);
 
     loop {
-        let accept = listener.accept();
-        if accept.is_err() {
-            continue;
+        match listener.accept() {
+            Ok((stream, _)) => {
+                handle_connection(stream, hub.clone());
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
-        let (stream, _) = accept.unwrap();
-        handle_connection(stream, hub.clone());
     }
 }
 
@@ -152,7 +157,7 @@ fn handle_learn_get(s: &mut mio::net::TcpStream, path: &str, hub: WebHub) {
         return;
     }
     {
-        let mut guard = hub.lock().unwrap();
+        let mut guard = hub.lock().unwrap_or_else(|p| p.into_inner());
         guard.learn_requests.push_back((phrase.clone(), meaning.clone()));
     }
     let resp = format!("{{\"ok\":true,\"aprendido\":\"{}\"}}", json_escape(&phrase));
@@ -160,7 +165,7 @@ fn handle_learn_get(s: &mut mio::net::TcpStream, path: &str, hub: WebHub) {
 }
 
 fn handle_get_api(s: &mut mio::net::TcpStream, path: &str, hub: WebHub) {
-    let guard = hub.lock().unwrap();
+    let guard = hub.lock().unwrap_or_else(|p| p.into_inner());
     match path {
         "/api/status" => send_json(s, 200, guard.status.as_str()),
         "/api/config" => {
@@ -209,7 +214,7 @@ fn format_voices(voices: &[String]) -> String {
 }
 
 fn handle_write_api(s: &mut mio::net::TcpStream, path: &str, body: &str, hub: WebHub) {
-    let mut guard = hub.lock().unwrap();
+    const MAX_PDF_BYTES: usize = 25 * 1024 * 1024; // 25 MB
 
     if path == "/api/command" {
         let text = extract_json_string(body, "text").unwrap_or_default();
@@ -217,7 +222,7 @@ fn handle_write_api(s: &mut mio::net::TcpStream, path: &str, body: &str, hub: We
             send_json(s, 400, "{\"error\":\"texto vacio\"}");
             return;
         }
-        guard.commands.push_back(text);
+        hub.lock().unwrap_or_else(|p| p.into_inner()).commands.push_back(text);
         send_json(s, 200, "{\"ok\":true,\"recibido\":true}");
         return;
     }
@@ -229,13 +234,14 @@ fn handle_write_api(s: &mut mio::net::TcpStream, path: &str, body: &str, hub: We
             send_json(s, 400, "{\"error\":\"texto vacio\"}");
             return;
         }
-        guard.rules_requests.push_back((accion, texto.clone()));
+        hub.lock().unwrap_or_else(|p| p.into_inner()).rules_requests.push_back((accion, texto.clone()));
         let resp = format!("{{\"ok\":true,\"accion\":\"{}\"}}", json_escape(&texto));
         send_json(s, 200, resp.as_str());
         return;
     }
 
     if path == "/api/config" {
+        let mut guard = hub.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(name) = extract_json_string(body, "name") {
             if !name.is_empty() {
                 guard.commands.push_back(format!("nombre {}", name));
@@ -256,12 +262,13 @@ fn handle_write_api(s: &mut mio::net::TcpStream, path: &str, body: &str, hub: We
             send_json(s, 400, "{\"error\":\"texto vacio\"}");
             return;
         }
-        guard.speak_requests.push_back(text);
+        hub.lock().unwrap_or_else(|p| p.into_inner()).speak_requests.push_back(text);
         send_json(s, 200, "{\"ok\":true,\"hablando\":true}");
         return;
     }
 
     if path == "/api/voice" {
+        let mut guard = hub.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(enabled) = extract_json_bool(body, "activa") {
             guard.voice_enabled = enabled;
         }
@@ -282,7 +289,11 @@ fn handle_write_api(s: &mut mio::net::TcpStream, path: &str, body: &str, hub: We
             return;
         }
         let pdf_bytes = match base64_decode(&b64) {
-            Some(bytes) if !bytes.is_empty() => bytes,
+            Some(bytes) if !bytes.is_empty() && bytes.len() <= MAX_PDF_BYTES => bytes,
+            Some(_) => {
+                send_json(s, 413, "{\"error\":\"PDF demasiado grande (max 25 MB)\"}");
+                return;
+            }
             _ => {
                 send_json(s, 400, "{\"error\":\"base64 invalido\"}");
                 return;
@@ -296,26 +307,27 @@ fn handle_write_api(s: &mut mio::net::TcpStream, path: &str, body: &str, hub: We
         let _ = std::fs::create_dir_all(&folder);
         let path = format!("{}{}.pdf", folder, clean_name);
         let _ = std::fs::write(&path, &pdf_bytes);
-        let text = extract_pdf_text(&pdf_bytes);
-        if text.trim().chars().count() < 10 {
-            send_json(
-                s,
-                200,
-                &format!(
-                    "{{\"ok\":true,\"nombre\":\"{}\",\"texto_len\":0,\"msg\":\"no se pudo extraer texto\"}}",
-                    json_escape(&clean_name)
-                ),
-            );
-            return;
-        }
-        guard.pdf_requests.push_back((clean_name.clone(), text.trim().to_string()));
+
+        // Extraer texto en un hilo separado con timeout, sin bloquear el lock del hub
+        let hub_clone = hub.clone();
+        let clean_name_clone = clean_name.clone();
+        let pdf_bytes_clone = pdf_bytes.clone();
+        std::thread::spawn(move || {
+            let text = extract_pdf_text_with_timeout(&pdf_bytes_clone, 15);
+            let text_len = text.trim().chars().count();
+            if text_len < 10 {
+                return;
+            }
+            hub_clone.lock().unwrap_or_else(|p| p.into_inner()).pdf_requests.push_back((clean_name_clone, text.trim().to_string()));
+        });
+
         send_json(
             s,
             200,
             &format!(
                 "{{\"ok\":true,\"nombre\":\"{}\",\"texto_len\":{}}}",
                 json_escape(&clean_name),
-                text.trim().chars().count()
+                0 // se actualiza cuando termine el hilo
             ),
         );
         return;
@@ -325,7 +337,7 @@ fn handle_write_api(s: &mut mio::net::TcpStream, path: &str, body: &str, hub: We
         if let Some(phrase) = extract_json_string(body, "phrase") {
             if let Some(meaning) = extract_json_string(body, "meaning") {
                 if !phrase.is_empty() && !meaning.is_empty() {
-                    guard.learn_requests.push_back((phrase, meaning));
+                    hub.lock().unwrap_or_else(|p| p.into_inner()).learn_requests.push_back((phrase, meaning));
                     send_json(s, 200, "{\"ok\":true}");
                     return;
                 }
@@ -462,13 +474,13 @@ fn get_voice_model() -> Result<std::sync::Arc<crate::voice::VoiceModel>, String>
         std::sync::Mutex<Option<std::sync::Arc<crate::voice::VoiceModel>>>,
     > = std::sync::OnceLock::new();
     let cell = VOICE.get_or_init(|| std::sync::Mutex::new(None));
-    if let Some(m) = cell.lock().unwrap().clone() {
+    if let Some(m) = cell.lock().unwrap_or_else(|p| p.into_inner()).clone() {
         return Ok(m);
     }
     let m = std::sync::Arc::new(
         crate::voice::build_voice().map_err(|e| e.to_string())?,
     );
-    let _ = cell.lock().unwrap().replace(m.clone());
+    let _ = cell.lock().unwrap_or_else(|p| p.into_inner()).replace(m.clone());
     println!("Voz Piper cargada para el dashboard web");
     Ok(m)
 }
@@ -634,6 +646,47 @@ fn extract_pdf_text(pdf: &[u8]) -> String {
     naive_pdf_text(pdf)
 }
 
+fn extract_pdf_text_with_timeout(pdf: &[u8], timeout_secs: u64) -> String {
+    if let Ok(mut child) = std::process::Command::new("pdftotext")
+        .arg("-eol")
+        .arg("dos")
+        .arg("-")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        let stdin = child.stdin.take();
+        if let Some(mut si) = stdin {
+            let _ = si.write_all(pdf);
+            drop(si);
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                if status.success() {
+                    if let Ok(output) = child.wait_with_output() {
+                        let text = String::from_utf8_lossy(&output.stdout).to_string();
+                        if text.trim().chars().count() >= 10 {
+                            return text;
+                        }
+                    }
+                }
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    naive_pdf_text(pdf)
+}
+
 fn naive_pdf_text(pdf: &[u8]) -> String {
     let s = String::from_utf8_lossy(pdf);
     let bytes = s.as_bytes();
@@ -777,6 +830,7 @@ const DASHBOARD_HTML: &str = r###"
   <button class="tab" onclick="showTab('sec_ordenes', this)">ORDENES</button>
   <button class="tab" onclick="showTab('sec_cuerpo', this)">CUERPO</button>
   <button class="tab" onclick="showTab('sec_percepcion', this)">PERCEPCION</button>
+  <button class="tab" onclick="showTab('sec_flujos', this)">FLUJOS</button>
   <button class="tab" onclick="showTab('sec_conocimiento', this)">CONOCIMIENTO</button>
   <button class="tab" onclick="showTab('sec_reglas', this)">REGLAS</button>
   <button class="tab" onclick="showTab('sec_config', this)">CONFIGURACION</button>
@@ -800,6 +854,7 @@ const DASHBOARD_HTML: &str = r###"
         <tr><td>Experiencias</td><td><b id="experiencias">-</b></td></tr>
         <tr><td>Adaptaciones</td><td><b id="adaptaciones">-</b></td></tr>
         <tr><td>Recompensa total</td><td><b id="recompensa">-</b></td></tr>
+        <tr><td>Flujo</td><td><b id="flujo_mon">-</b></td></tr>
       </table>
     </div>
 
@@ -886,6 +941,41 @@ const DASHBOARD_HTML: &str = r###"
         <div class="sensorrow"><span>Voz detectada</span><span id="oido_voz">-</span></div>
       </div>
       <div id="oido_texto" style="margin-top:8px;font-size:12px;color:#8b949e">Todavia no he escuchado.</div>
+    </div>
+  </div>
+</section>
+
+<section id="sec_flujos" class="sec" hidden>
+  <div class="grid">
+    <div class="panel">
+      <h1 style="font-size:14px">FLUJOS - JORNADA DE 9 HORAS (comportamiento de perro)</h1>
+      <p style="font-size:12px;color:#8b949e">
+        Cuando nadie le ordena nada, susana sigue una jornada de 9 horas en bloques de 1h
+        con comportamientos inspirados en perros. Cualquier orden la pone en pausa;
+        vuelve sola tras unos minutos sin ordenes o si le dices "sigue con tus tareas".
+      </p>
+      <div style="margin-bottom:8px">
+        <span>Flujo actual: <b id="flujo_actual">-</b></span>
+        <span style="margin-left:12px">Estado: <b id="flujo_estado">-</b></span>
+        <span style="margin-left:12px">Bloque: <b id="flujo_segmento">-</b> de <b id="flujo_total">-</b></span>
+      </div>
+      <div class="sensorrow">
+        <span>Jornada</span>
+        <div class="barw" style="flex:1"><div class="barf" id="flujo_bar" style="width:0%"></div></div>
+        <span id="flujo_avance">-</span>
+      </div>
+      <div style="margin-top:12px">
+        <button class="act" onclick="cmdText('sigue con tus tareas')">Sigue con tus tareas</button>
+        <button onclick="cmd('pausa')">Pausa</button>
+        <button onclick="cmd('reanudar')">Reanudar</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h1 style="font-size:14px">HORARIO</h1>
+      <table id="flujo_tabla">
+        <tr><th>Bloque</th><th>Comportamiento</th></tr>
+      </table>
     </div>
   </div>
 </section>
@@ -985,6 +1075,7 @@ const DASHBOARD_HTML: &str = r###"
 <script>
 let wake = '';
 let lastMsg = '';
+const HORARIO_UI = ['Explorar el entorno','Vigilar el hogar','Rondar el perimetro','Descansar (siesta)','Explorar el entorno','Vigilar el hogar','Jugar un poco','Rondar el perimetro','Esperar al dueno'];
 function log(msg){ const c=document.getElementById('chat'); c.textContent += msg+'\n'; c.scrollTop=c.scrollHeight; }
 function jstr(s){ return JSON.stringify(s); }
 function cmd(c){ enviarTexto(wake + ' ' + c); }
@@ -1140,13 +1231,33 @@ async function refresh(){
     }
     if(d.oido_voz!=null){ document.getElementById('oido_voz').textContent = d.oido_voz ? 'SI' : 'no'; }
     if(d.oido_texto){ document.getElementById('oido_texto').textContent = d.oido_texto; }
-    // mensaje del robot
-    if(d.mensaje && d.mensaje.length){
-      log(d.mensaje);
-      if(document.getElementById('voz_activa').checked && d.mensaje!==lastMsg){
-        lastMsg=d.mensaje;
-        playWavText(d.mensaje);
+    // flujos
+    if(d.flujo!=null){
+      document.getElementById('flujo_actual').textContent = d.flujo;
+      document.getElementById('flujo_estado').textContent = d.flujo_estado;
+      document.getElementById('flujo_mon').textContent = d.flujo + ' (' + d.flujo_estado + ')';
+      document.getElementById('flujo_segmento').textContent = d.flujo_segmento;
+      document.getElementById('flujo_total').textContent = d.flujo_total;
+      const fseg = d.flujo_segmento||0, ftot = d.flujo_total||9;
+      document.getElementById('flujo_bar').style.width = Math.min(100,(fseg/ftot*100))+'%';
+      document.getElementById('flujo_avance').textContent = (d.flujo_avance!=null ? d.flujo_avance.toFixed(1)+'h' : '-');
+      const tb = document.getElementById('flujo_tabla');
+      if(tb){
+        tb.innerHTML='<tr><th>Bloque</th><th>Comportamiento</th></tr>';
+        HORARIO_UI.forEach(function(n,i){
+          const tr=document.createElement('tr');
+          const t1=document.createElement('td'); t1.textContent=(i+1)+'/'+d.flujo_total;
+          const t2=document.createElement('td'); t2.textContent=n;
+          if((i+1)===fseg){ tr.style.background='#21262d'; tr.style.fontWeight='bold'; t2.style.color='var(--acc)'; }
+          tr.appendChild(t1); tr.appendChild(t2); tb.appendChild(tr);
+        });
       }
+    }
+    // mensaje del robot
+    if(d.mensaje && d.mensaje.length && d.mensaje!==lastMsg){
+      lastMsg=d.mensaje;
+      log(d.mensaje);
+      if(document.getElementById('voz_activa').checked){ playWavText(d.mensaje); }
     }
   }catch(e){}
 }

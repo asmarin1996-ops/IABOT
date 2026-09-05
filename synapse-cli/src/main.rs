@@ -4,11 +4,14 @@ use std::io::{self, Write};
 use std::collections::HashMap;
 
 mod commands;
+mod flows;
 mod voice;
 mod web;
 
 use commands::parse_web_command;
 use commands::WebCommand;
+use chrono::Local;
+use flows::Flujos;
 use synapse_core::brain::{Action, Brain};
 use synapse_core::learning::{LearningEngine, Reward};
 use synapse_core::state::AgentState;
@@ -69,6 +72,8 @@ struct SynapseMind {
     paused: bool,
     last_message: String,
     last_wake_at: std::time::Instant,
+    ultima_orden_at: std::time::Instant,
+    flujos: Flujos,
 }
 
 /// Registra el "cuerpo" del robot: en una Raspberry Pi usa actuadores reales
@@ -258,6 +263,9 @@ impl SynapseMind {
             paused: false,
             last_message: "Listo para aprender.".to_string(),
             last_wake_at: std::time::Instant::now(),
+            ultima_orden_at: std::time::Instant::now()
+                - std::time::Duration::from_secs(3600),
+            flujos: Flujos::new(),
         })
     }
 
@@ -449,6 +457,26 @@ impl SynapseMind {
         self.robot.execute_action(action, &mut self.world);
     }
 
+    /// Detiene los motores sin tocar la cabeza (para flujos estaticos).
+    fn aplicar_stop(&mut self) {
+        use synapse_hal::actuator::ActuatorCommand;
+        self.actuators
+            .execute_all(ActuatorCommand::Custom("motor_izq".to_string(), vec![0.0]));
+        self.actuators
+            .execute_all(ActuatorCommand::Custom("motor_der".to_string(), vec![0.0]));
+        self.last_motor_izq = 0.0;
+        self.last_motor_der = 0.0;
+    }
+
+    /// Lee una configuracion numerica de la base de memoria.
+    fn config_i64(&self, key: &str) -> Option<i64> {
+        self.memory_db
+            .get_config(key)
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+    }
+
     fn memoria_baja(&self, umbral_mb: u64) -> bool {
         free_memory_mb().map(|libre| libre < umbral_mb).unwrap_or(false)
     }
@@ -480,6 +508,13 @@ impl SynapseMind {
             self.last_wake_at = std::time::Instant::now();
         }
 
+        // Toda orden (no "ignore") para el flujo autonomo y la registra como
+        // actividad reciente; la primera del dia despierta la jornada.
+        if !matches!(command, WebCommand::Ignore) {
+            self.ultima_orden_at = std::time::Instant::now();
+            self.flujos.orden_recibida(Local::now().date_naive());
+        }
+
         if let Some(blocked) = self.rule_blocks_command(msg, &command) {
             return format!(
                 "No puedo hacer eso: tengo una regla absoluta que debo cumplir siempre: '{}'.",
@@ -500,13 +535,15 @@ impl SynapseMind {
             }
             WebCommand::Pause => {
                 self.paused = true;
-                return "Pausado.".to_string();
+                return "Pausado. Cuando quieras que retome mis flujos, dimelo.".to_string();
             }
             WebCommand::Resume => {
                 self.paused = false;
-                return "Reanudado.".to_string();
+                self.flujos.reanudar();
+                return "Reanudado: sigo con mis tareas.".to_string();
             }
             WebCommand::Train(n) => {
+                let n = n.clamp(1, 300);
                 let _r = self.run_training(n);
                 return format!("Entrenamiento de {} episodios terminado.", n);
             }
@@ -545,7 +582,7 @@ impl SynapseMind {
             }
             WebCommand::Help => {
                 return format!(
-                    "Puedes decirme: adelante, atras, izquierda, derecha, stop, pausa, reanudar, estado, diagnostico, entrenar <n>, nombre <x>, activacion <x>"
+                    "Puedes decirme: adelante, atras, izquierda, derecha, stop, pausa, reanudar (o 'sigue con tus tareas'), estado, diagnostico, entrenar <n>, nombre <x>, activacion <x>. Sin ordenes, sigo mi jornada de 9 horas sola."
                 );
             }
             WebCommand::DoKnowledge => {
@@ -593,20 +630,25 @@ impl SynapseMind {
             }
             WebCommand::MoveServo(name, angle) => {
                 use synapse_hal::actuator::ActuatorCommand;
+                let clamped = if name.starts_with("servo_") {
+                    angle.clamp(0.0, 180.0)
+                } else {
+                    angle.clamp(-1.0, 1.0)
+                };
                 let mut found = false;
                 let mut moved = false;
                 for a in self.actuators.actuators.iter_mut() {
                     let nm = a.name().to_string();
                     if nm == name {
                         found = true;
-                        match a.execute(ActuatorCommand::Custom(name.clone(), vec![angle])) {
+                        match a.execute(ActuatorCommand::Custom(name.clone(), vec![clamped])) {
                             Ok(()) => moved = true,
                             Err(e) => log::warn!("actuador '{}': {}", nm, e),
                         }
                         match nm.as_str() {
-                            "motor_izq" => self.last_motor_izq = angle,
-                            "motor_der" => self.last_motor_der = angle,
-                            "servo_cabezal" => self.last_cabeza = angle,
+                            "motor_izq" => self.last_motor_izq = clamped,
+                            "motor_der" => self.last_motor_der = clamped,
+                            "servo_cabezal" => self.last_cabeza = clamped,
                             _ => {}
                         }
                     }
@@ -617,7 +659,7 @@ impl SynapseMind {
                 if !moved {
                     return format!("El servo {} no está conectado en este momento.", name);
                 }
-                return format!("Moviendo {} a {} grados.", name, angle);
+                return format!("Moviendo {} a {} grados.", name, clamped);
             }
             WebCommand::QueVes => {
                 if self.last_vision_at.elapsed() < std::time::Duration::from_secs(5) {
@@ -708,7 +750,7 @@ impl SynapseMind {
         });
         let payload = serde_json::to_string(&body).ok()?;
         let mut sock = TcpStream::connect(("127.0.0.1", 9091)).ok()?;
-        let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(90)));
+        let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(20)));
         let req = format!(
             "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:9091\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             payload.len(),
@@ -1031,7 +1073,7 @@ impl SynapseMind {
         };
 
         format!(
-            "{{\"nombre\":\"{}\",\"activacion\":\"{}\",\"emocion\":\"{}\",\"emoji\":\"{}\",\"confianza\":{},\"estres\":{},\"energia\":{},\"curiosidad\":{},\"explotacion\":{},\"explotar\":{},\"episodio\":{},\"total_metas\":{},\"posicion\":\"({}, {})\",\"estados\":{},\"experiencias\":{},\"adaptaciones\":{},\"recompensa\":{},\"mundo\":\"{}\",\"sensores\":{},\"vista_brillo\":{},\"vista_movimiento\":{},\"vista_texto\":\"{}\",\"oido_nivel\":{},\"oido_voz\":{},\"oido_texto\":\"{}\",\"motor_izq\":{},\"motor_der\":{},\"servo_cabezal\":{},\"mensaje\":\"{}\"}}",
+            "{{\"nombre\":\"{}\",\"activacion\":\"{}\",\"emocion\":\"{}\",\"emoji\":\"{}\",\"confianza\":{},\"estres\":{},\"energia\":{},\"curiosidad\":{},\"explotacion\":{},\"explotar\":{},\"episodio\":{},\"total_metas\":{},\"posicion\":\"({}, {})\",\"estados\":{},\"experiencias\":{},\"adaptaciones\":{},\"recompensa\":{},\"mundo\":\"{}\",\"sensores\":{},\"vista_brillo\":{},\"vista_movimiento\":{},\"vista_texto\":\"{}\",\"oido_nivel\":{},\"oido_voz\":{},\"oido_texto\":\"{}\",\"motor_izq\":{},\"motor_der\":{},\"servo_cabezal\":{},\"flujo\":\"{}\",\"flujo_estado\":\"{}\",\"flujo_segmento\":{},\"flujo_total\":{},\"flujo_avance\":{},\"mensaje\":\"{}\"}}",
             self.name,
             self.wake_word,
             self.emotion.dominant_emotion(),
@@ -1061,6 +1103,11 @@ impl SynapseMind {
             self.last_motor_izq,
             self.last_motor_der,
             self.last_cabeza,
+            self.flujos.flujo_nombre(),
+            self.flujos.estado_str(self.paused),
+            self.flujos.segmento() + 1,
+            self.flujos.total_segmentos(),
+            self.flujos.avance_horas(),
             Self::json_escape_multi(&self.last_message),
         )
     }
@@ -1219,10 +1266,10 @@ impl SynapseMind {
                 Ok(model) => {
                     let voices = model.voices.clone();
                     {
-                        let mut g = hub_for_voice.lock().unwrap();
+                        let mut g = hub_for_voice.lock().unwrap_or_else(|p| p.into_inner());
                         g.voices = voices;
                     }
-                    *voice_load.lock().unwrap() = Some(std::sync::Arc::new(model));
+                    *voice_load.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::sync::Arc::new(model));
                 }
                 Err(e) => {
                     eprintln!("No se pudo cargar el modelo de voz: {}", e);
@@ -1238,20 +1285,24 @@ impl SynapseMind {
                 if processed >= 10 {
                     break;
                 }
-                let next = hub.lock().unwrap().commands.pop_front();
+                let next = hub.lock().unwrap_or_else(|p| p.into_inner()).commands.pop_front();
                 if next.is_none() {
                     break;
                 }
                 processed += 1;
                 let msg = next.unwrap();
                 let response = self.process_message(msg.as_str());
-                self.last_message = response.clone();
-                self.speak_response(&hub, &voice_holder, &response);
+                let mut final_resp = response;
+                if let Some(anuncio) = self.flujos.tomar_anuncio() {
+                    final_resp = format!("{} | {}", anuncio, final_resp);
+                }
+                self.last_message = final_resp.clone();
+                self.speak_response(&hub, &voice_holder, &final_resp);
             }
             let _ = processed;
 
             loop {
-                let next = hub.lock().unwrap().speak_requests.pop_front();
+                let next = hub.lock().unwrap_or_else(|p| p.into_inner()).speak_requests.pop_front();
                 if next.is_none() {
                     break;
                 }
@@ -1259,7 +1310,7 @@ impl SynapseMind {
             }
 
             loop {
-                let next = hub.lock().unwrap().learn_requests.pop_front();
+                let next = hub.lock().unwrap_or_else(|p| p.into_inner()).learn_requests.pop_front();
                 if next.is_none() {
                     break;
                 }
@@ -1271,7 +1322,7 @@ impl SynapseMind {
             }
 
             loop {
-                let next = hub.lock().unwrap().pdf_requests.pop_front();
+                let next = hub.lock().unwrap_or_else(|p| p.into_inner()).pdf_requests.pop_front();
                 if next.is_none() {
                     break;
                 }
@@ -1283,7 +1334,7 @@ impl SynapseMind {
             }
 
             loop {
-                let next = hub.lock().unwrap().rules_requests.pop_front();
+                let next = hub.lock().unwrap_or_else(|p| p.into_inner()).rules_requests.pop_front();
                 if next.is_none() {
                     break;
                 }
@@ -1303,6 +1354,11 @@ impl SynapseMind {
                 self.speak_response(&hub, &voice_holder, &response);
             }
 
+            // Flujos: comportamiento autonomo mientras no recibe ordenes
+            let mut flujos = std::mem::take(&mut self.flujos);
+            flujos.tick(self);
+            self.flujos = flujos;
+
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
@@ -1317,13 +1373,13 @@ impl SynapseMind {
             return;
         }
         let (enabled, vname) = {
-            let g = hub.lock().unwrap();
+            let g = hub.lock().unwrap_or_else(|p| p.into_inner());
             (g.voice_enabled, g.voice_name.clone())
         };
         if !enabled {
             return;
         }
-        let model = holder.lock().unwrap().clone();
+        let model = holder.lock().unwrap_or_else(|p| p.into_inner()).clone();
         if model.is_none() {
             return;
         }
@@ -1345,7 +1401,7 @@ impl SynapseMind {
         }
 
         let status = self.status_json();
-        let mut guard = hub.lock().unwrap();
+        let mut guard = hub.lock().unwrap_or_else(|p| p.into_inner());
         guard.name = self.name.to_string();
         guard.wake_word = self.wake_word.to_string();
         guard.status = status;

@@ -91,7 +91,7 @@ pub fn parse_web_command(input: &str, wake_word: &str, grace_active: bool) -> We
     if contains_any(&detect, &["pausa", "pausar", "pause", "detenerte", "deten", "espera", "quieto"]) {
         return WebCommand::Pause;
     }
-    if contains_any(&detect, &["reanuda", "reanudar", "resume", "sigueme", "seguir", "continua", "sigue"]) {
+    if contains_any(&detect, &["reanuda", "reanudar", "resume", "sigueme", "seguir", "continua", "sigue", "con tus tareas", "a tus tareas", "tus tareas", "tu trabajo", "tu rutina", "tus flujos"]) {
         return WebCommand::Resume;
     }
 
