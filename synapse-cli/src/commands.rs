@@ -57,10 +57,19 @@ pub fn parse_web_command(input: &str, wake_word: &str, grace_active: bool) -> We
     }
 
     // ESTADO / DIAGNOSTICO / AYUDA
-    if contains_any(&text, &["estado", "status", "como estas", "que tal", "telemetria"]) {
+    if has_word(&text, "estado")
+        || has_word(&text, "status")
+        || has_word(&text, "telemetria")
+        || contains_any(&text, &["como estas", "que tal"])
+    {
         return WebCommand::DoStatus;
     }
-    if contains_any(&text, &["diagnostico", "diagnostic", "salud", "revision", "health", "revisa"]) {
+    if has_word(&text, "diagnostico")
+        || has_word(&text, "diagnostic")
+        || has_word(&text, "health")
+        || has_word(&text, "salud")
+        || contains_any(&text, &["revision", "revisa", "revisar"])
+    {
         return WebCommand::DoDiagnostic;
     }
     if contains_any(&text, &["ayuda", "help", "comandos", "que puedes hacer", "opciones"]) {
@@ -161,6 +170,10 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
         }
     }
     false
+}
+
+fn has_word(text: &str, word: &str) -> bool {
+    text.split_whitespace().any(|t| t == word)
 }
 
 fn detect_number(text: &str) -> Option<u64> {
@@ -266,15 +279,26 @@ fn is_plain_word(s: &str) -> bool {
 }
 
 fn is_mention_expr(text: &str) -> bool {
-    let low = text;
-    low.contains("oye")
-        || low.contains("hey")
-        || low.contains("ai")
-        || low.contains("presentate")
-        || low.contains("quien eres")
-        || low.contains("hola")
-        || low.contains("buenas")
-        || low.contains("saluda")
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let single = ["hola", "buenas", "buenos", "hey", "eai", "ai", "oye", "harmonia", "cortesia"];
+    if tokens.len() <= 3 {
+        for t in &tokens {
+            for g in &single {
+                if t.eq_ignore_ascii_case(g) {
+                    return true;
+                }
+            }
+        }
+        let phrase = tokens.join(" ");
+        return phrase.contains("que hay")
+            || phrase.contains("que hubo")
+            || phrase.contains("buenos dias")
+            || phrase.contains("buenas tardes")
+            || phrase.contains("buenas noches")
+            || phrase.contains("quien eres")
+            || phrase.contains("presentate");
+    }
+    false
 }
 
 fn is_direct_command(text: &str) -> bool {

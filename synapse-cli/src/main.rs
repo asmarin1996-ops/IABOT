@@ -474,7 +474,8 @@ impl SynapseMind {
                 out
             }
             WebCommand::Unknown => {
-                match self.retrieve(msg) {
+                let query = query_without_wake(msg, &self.wake_word);
+                match self.retrieve(&query) {
                     Some(e) if e.cat == "material" => {
                         let src = if e.source.is_empty() {
                             "el PDF".to_string()
@@ -483,9 +484,9 @@ impl SynapseMind {
                         };
                         format!("Del documento {}, recuerdo: {}", src, e.value)
                     }
-                    Some(e) => e.value.clone(),
+                    Some(e) => natural_answer(&normalize_key(&query), &e.value),
                     None => {
-                        "Aun no tengo informacion sobre eso. Ensename con 'aprende que X es Y' o sube un PDF."
+                        "Todavia no se eso y prefiero no inventar. Puedes ensenarme con 'aprende que X es Y' o subir un PDF."
                             .to_string()
                     }
                 }
@@ -585,7 +586,8 @@ impl SynapseMind {
                 }
             }
             let seq_bonus: i64 = if seq_hint { 8 } else { 0 };
-            if match_count < 2 {
+            let need = if q_tokens.len() == 1 { 1 } else { 2 };
+            if match_count < need {
                 continue;
             }
             let cat_bias: i64 = if e.cat == "material" { 2 } else { 0 };
@@ -1191,6 +1193,166 @@ fn load_rules(db: &MemoryDatabase) -> Vec<Rule> {
             text,
         })
         .collect()
+}
+
+fn query_without_wake(msg: &str, wake: &str) -> String {
+    let w = wake.trim();
+    if w.is_empty() {
+        return msg.trim().to_string();
+    }
+    msg.split_whitespace()
+        .filter(|t| !t.eq_ignore_ascii_case(w))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+fn topic_after(query: &str, marker: &str) -> Option<String> {
+    let idx = query.find(marker)?;
+    let rest = query[idx + marker.len()..].trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_string())
+    }
+}
+
+fn fmt_ubicacion(subject: &str, verb: &str, value: &str) -> String {
+    let v = value.trim();
+    if v.starts_with("en ") || v.starts_with("al ") || v.starts_with("a la ") {
+        format!("{} {} {}.", capitalize_first(subject), verb, v)
+    } else {
+        format!("{} {} en {}.", capitalize_first(subject), verb, v)
+    }
+}
+
+fn natural_answer(query: &str, value: &str) -> String {
+    let q = query;
+    let v = value.trim();
+
+    if q.contains("al sur de") {
+        if let Some(t) = topic_after(q, "al sur de") {
+            return format!("El pais al sur de {} es {}.", t, v);
+        }
+    }
+
+    let ubic_markers = [
+        ("en que estado de mexico esta", "esta"),
+        ("en que costa de colombia esta", "esta"),
+        ("en que pais nacieron", "nacieron"),
+        ("en que pais estan", "estan"),
+        ("en que continente esta", "esta"),
+        ("en que pais esta", "esta"),
+        ("en que ciudad esta", "esta"),
+        ("en que cordillera esta", "esta"),
+    ];
+    for (m, verb) in ubic_markers {
+        if q.contains(m) {
+            if let Some(t) = topic_after(q, m) {
+                return fmt_ubicacion(&t, verb, v);
+            }
+        }
+    }
+    if q.contains("donde estan") {
+        if let Some(t) = topic_after(q, "donde estan") {
+            return fmt_ubicacion(&t, "estan", v);
+        }
+    }
+    if q.contains("donde esta ubicada") {
+        if let Some(t) = topic_after(q, "donde esta ubicada") {
+            return fmt_ubicacion(&t, "esta", v);
+        }
+    }
+    if q.contains("donde esta") {
+        if let Some(t) = topic_after(q, "donde esta") {
+            return fmt_ubicacion(&t, "esta", v);
+        }
+    }
+    if q.contains("capital de") {
+        if let Some(p) = topic_after(q, "capital de") {
+            return format!("La capital de {} es {}.", p, v);
+        }
+    }
+    if q.contains("ciudad mas poblada") {
+        if let Some(p) = topic_after(q, "mas poblada") {
+            return format!("La ciudad mas poblada de {} es {}.", p, v);
+        }
+    }
+    for (m, verbo) in [
+        ("quien escribio", "escribio"),
+        ("quien desarrollo", "desarrollo"),
+        ("quien invento", "invento"),
+        ("quien pinto", "pinto"),
+    ] {
+        if q.contains(m) {
+            if let Some(t) = topic_after(q, m) {
+                return format!("{} {} {}.", capitalize_first(v), verbo, t);
+            }
+        }
+    }
+    if q.contains("quien fue") || q.contains("quien es") {
+        let m = if q.contains("quien fue") {
+            "quien fue"
+        } else {
+            "quien es"
+        };
+        if let Some(t) = topic_after(q, m) {
+            return format!("{} fue {}.", capitalize_first(&t), v);
+        }
+    }
+    if q.contains("cuando se celebra") {
+        if let Some(t) = topic_after(q, "cuando se celebra") {
+            return format!("{} se celebra {}.", capitalize_first(&t), v);
+        }
+    }
+    if q.contains("cuando se usa") {
+        if let Some(t) = topic_after(q, "cuando se usa") {
+            return format!("{} se usa {}.", capitalize_first(&t), v);
+        }
+    }
+    if q.contains("en que ano") {
+        if let Some(t) = topic_after(q, "en que ano") {
+            return format!("{} en {}.", capitalize_first(&t), v);
+        }
+    }
+    if q.contains("cuantos") {
+        return format!("En total son {}.", v);
+    }
+    if q.contains("que hacer") {
+        return format!("Lo correcto es {}.", v);
+    }
+    if q.contains("que se dice") {
+        return format!("En esos casos sueles decir {}.", v);
+    }
+    if q.contains("que significa") || q.contains("que es ser") {
+        return format!("Significa {}.", v);
+    }
+    if q.contains("como se saluda") {
+        return format!("Al llegar: {}.", capitalize_first(v));
+    }
+    if q.starts_with("como se") {
+        let after = q["como se".len()..].trim();
+        let verb = after.split_whitespace().next().unwrap_or("hace");
+        return format!("Se {} {}.", verb, v);
+    }
+    if q.contains("cual es") {
+        if let Some(t) = topic_after(q, "cual es") {
+            return format!("{} es {}.", capitalize_first(&t), v);
+        }
+    }
+    if q.contains("que es ") || q.ends_with("que es") {
+        if let Some(t) = topic_after(q, "que es") {
+            return format!("{} es {}.", capitalize_first(&t), v);
+        }
+    }
+    format!("Te cuento que {}.", v)
 }
 
 fn split_sentences(text: &str) -> Vec<String> {
