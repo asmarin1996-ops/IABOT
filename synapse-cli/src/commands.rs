@@ -26,7 +26,7 @@ pub fn parse_web_command(input: &str, wake_word: &str, grace_active: bool) -> We
     let wake = normalize(wake_word);
     let has_wake = !wake.is_empty() && normalized.contains(&wake);
 
-    if !wake.is_empty() && !has_wake && !grace_active && !is_direct_command(&normalized) {
+    if !wake.is_empty() && !has_wake && !grace_active && !is_direct_command(&fold_accents(&normalized)) {
         return WebCommand::Ignore;
     }
 
@@ -39,40 +39,42 @@ pub fn parse_web_command(input: &str, wake_word: &str, grace_active: bool) -> We
         return WebCommand::Greeting;
     }
 
-    if is_mention_expr(&text) {
+    let detect = fold_accents(&text);
+
+    if is_mention_expr(&detect) {
         return WebCommand::Greeting;
     }
 
     // ORDEN DE MOVIMIENTO
-    if let Some(action) = detect_action(&text) {
+    if let Some(action) = detect_action(&detect) {
         return WebCommand::Action(action);
     }
 
     // PAUSA / REANUDAR
-    if contains_any(&text, &["pausa", "pausar", "pause", "detenerte", "deten", "espera", "quieto"]) {
+    if contains_any(&detect, &["pausa", "pausar", "pause", "detenerte", "deten", "espera", "quieto"]) {
         return WebCommand::Pause;
     }
-    if contains_any(&text, &["reanuda", "reanudar", "resume", "sigueme", "seguir", "continua", "sigue"]) {
+    if contains_any(&detect, &["reanuda", "reanudar", "resume", "sigueme", "seguir", "continua", "sigue"]) {
         return WebCommand::Resume;
     }
 
     // ESTADO / DIAGNOSTICO / AYUDA
-    if has_word(&text, "estado")
-        || has_word(&text, "status")
-        || has_word(&text, "telemetria")
-        || contains_any(&text, &["como estas", "que tal"])
+    if has_word(&detect, "estado")
+        || has_word(&detect, "status")
+        || has_word(&detect, "telemetria")
+        || contains_any(&detect, &["como estas", "que tal"])
     {
         return WebCommand::DoStatus;
     }
-    if has_word(&text, "diagnostico")
-        || has_word(&text, "diagnostic")
-        || has_word(&text, "health")
-        || has_word(&text, "salud")
-        || contains_any(&text, &["revision", "revisa", "revisar"])
+    if has_word(&detect, "diagnostico")
+        || has_word(&detect, "diagnostic")
+        || has_word(&detect, "health")
+        || has_word(&detect, "salud")
+        || contains_any(&detect, &["revision", "revisa", "revisar"])
     {
         return WebCommand::DoDiagnostic;
     }
-    if contains_any(&text, &["ayuda", "help", "comandos", "que puedes hacer", "opciones"]) {
+    if contains_any(&detect, &["ayuda", "help", "comandos", "que puedes hacer", "opciones"]) {
         return WebCommand::Help;
     }
 
@@ -111,16 +113,16 @@ pub fn parse_web_command(input: &str, wake_word: &str, grace_active: bool) -> We
     }
 
     // QUE SABES / CONOCIMIENTO APRENDIDO
-    if contains_any(&text, &["que sabes", "que aprendiste", "que has aprendido", "que sabemos", "que me ensenaste", "que dice el material", "lee el material", "que aprendiste del pdf", "que hay en el pdf"]) {
+    if contains_any(&detect, &["que sabes", "que aprendiste", "que has aprendido", "que sabemos", "que me ensenaste", "que dice el material", "lee el material", "que aprendiste del pdf", "que hay en el pdf"]) {
         return WebCommand::DoKnowledge;
     }
 
     // ENTRENAR con numero opcional
-    if let Some(n) = detect_number(&text) {
-        if contains_any(&text, &["entrenar", "entrena", "train", "aprendizaje", "aprende", "adestrar", "edutacion"]) {
+    if let Some(n) = detect_number(&detect) {
+        if contains_any(&detect, &["entrenar", "entrena", "train", "aprendizaje", "aprende", "adestrar", "edutacion"]) {
             return WebCommand::Train(n);
         }
-    } else if contains_any(&text, &["entrenar", "entrena", "train", "aprendizaje", "adestrar"]) {
+    } else if contains_any(&detect, &["entrenar", "entrena", "train", "aprendizaje", "adestrar"]) {
         return WebCommand::Train(50);
     }
 
@@ -130,7 +132,7 @@ pub fn parse_web_command(input: &str, wake_word: &str, grace_active: bool) -> We
     }
 
     // CAMBIAR PALABRA DE ACTIVACION
-    if let Some(w) = detect_wake(&text) {
+    if let Some(w) = detect_wake(&detect) {
         return WebCommand::SetWakeWord(w);
     }
 
@@ -245,6 +247,25 @@ fn normalize(input: &str) -> String {
     out
 }
 
+fn fold_accents(input: &str) -> String {
+    let mut out = String::new();
+    for c in input.chars() {
+        let lc = c.to_lowercase().next().unwrap_or(c);
+        let folded = match lc {
+            'á' => 'a',
+            'é' => 'e',
+            'í' => 'i',
+            'ó' => 'o',
+            'ú' => 'u',
+            'ü' => 'u',
+            'ñ' => 'n',
+            _ => lc,
+        };
+        out.push(folded);
+    }
+    out
+}
+
 fn clean_tail(s: &str) -> String {
     let mut cleaned = String::new();
     let mut prev_space = false;
@@ -314,14 +335,5 @@ fn is_direct_command(text: &str) -> bool {
 }
 
 fn lower(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        let lower_b = if b >= b'A' && b <= b'Z' {
-            b + 32
-        } else {
-            b
-        };
-        out.push(lower_b as char);
-    }
-    out
+    s.chars().flat_map(|c| c.to_lowercase()).collect()
 }

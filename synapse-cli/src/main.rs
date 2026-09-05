@@ -484,7 +484,7 @@ impl SynapseMind {
                         };
                         format!("Del documento {}, recuerdo: {}", src, e.value)
                     }
-                    Some(e) => natural_answer(&normalize_key(&query), &e.value),
+                    Some(e) => natural_answer(&normalize_key(&query), &e.key, &e.value),
                     None => {
                         "Todavia no se eso y prefiero no inventar. Puedes ensenarme con 'aprende que X es Y' o subir un PDF."
                             .to_string()
@@ -1123,6 +1123,25 @@ fn normalize_key(key: &str) -> String {
     let mut last_space = false;
     for c in key.chars() {
         let lc = c.to_lowercase().next().unwrap_or(c);
+        if lc.is_alphanumeric() {
+            out.push(lc);
+            last_space = false;
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+fn normalize_fold(key: &str) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+    for c in key.chars() {
+        let lc = c.to_lowercase().next().unwrap_or(c);
         let folded = match lc {
             'á' => 'a',
             'é' => 'e',
@@ -1155,7 +1174,7 @@ fn tokenize(text: &str) -> Vec<String> {
         "este", "esa", "el", "la", "de", "es", "me", "se", "y", "a", "o", "e", "su", "en", "al",
         "fue", "tiempo", "dia", "dia",
     ];
-    normalize_key(text)
+    normalize_fold(text)
         .split_whitespace()
         .map(|t| t.to_string())
         .filter(|t| t.len() >= 3 && !STOP.contains(&t.as_str()))
@@ -1224,6 +1243,27 @@ fn topic_after(query: &str, marker: &str) -> Option<String> {
     }
 }
 
+fn topic_subject(query_folded: &str, key_orig: &str, key_folded: &str, marker: &str) -> Option<String> {
+    if let Some(idx) = key_folded.find(marker) {
+        let nchars = key_folded[..idx].chars().count() + marker.chars().count();
+        let mut iter = key_orig.chars();
+        let mut skipped = 0usize;
+        let mut rest = String::new();
+        for c in iter.by_ref() {
+            if skipped >= nchars {
+                rest.push(c);
+            } else {
+                skipped += 1;
+            }
+        }
+        let t = rest.trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    topic_after(query_folded, marker)
+}
+
 fn fmt_ubicacion(subject: &str, verb: &str, value: &str) -> String {
     let v = value.trim();
     if v.starts_with("en ") || v.starts_with("al ") || v.starts_with("a la ") {
@@ -1233,66 +1273,68 @@ fn fmt_ubicacion(subject: &str, verb: &str, value: &str) -> String {
     }
 }
 
-fn natural_answer(query: &str, value: &str) -> String {
-    let q = query;
+fn natural_answer(query: &str, key: &str, value: &str) -> String {
+    let q = normalize_fold(query);
+    let key_orig = normalize_key(key);
+    let key_folded = normalize_fold(&key_orig);
     let v = value.trim();
 
     if q.contains("al sur de") {
-        if let Some(t) = topic_after(q, "al sur de") {
-            return format!("El pais al sur de {} es {}.", t, v);
+        if let Some(t) = topic_subject(&q, &key_orig, &key_folded, "al sur de") {
+            return format!("El país al sur de {} es {}.", t, v);
         }
     }
 
     let ubic_markers = [
-        ("en que estado de mexico esta", "esta"),
-        ("en que costa de colombia esta", "esta"),
+        ("en que estado de mexico esta", "está"),
+        ("en que costa de colombia esta", "está"),
         ("en que pais nacieron", "nacieron"),
-        ("en que pais estan", "estan"),
-        ("en que continente esta", "esta"),
-        ("en que pais esta", "esta"),
-        ("en que ciudad esta", "esta"),
-        ("en que cordillera esta", "esta"),
+        ("en que pais estan", "están"),
+        ("en que continente esta", "está"),
+        ("en que pais esta", "está"),
+        ("en que ciudad esta", "está"),
+        ("en que cordillera esta", "está"),
     ];
     for (m, verb) in ubic_markers {
         if q.contains(m) {
-            if let Some(t) = topic_after(q, m) {
+            if let Some(t) = topic_subject(&q, &key_orig, &key_folded, m) {
                 return fmt_ubicacion(&t, verb, v);
             }
         }
     }
     if q.contains("donde estan") {
-        if let Some(t) = topic_after(q, "donde estan") {
-            return fmt_ubicacion(&t, "estan", v);
+        if let Some(t) = topic_subject(&q, &key_orig, &key_folded, "donde estan") {
+            return fmt_ubicacion(&t, "están", v);
         }
     }
     if q.contains("donde esta ubicada") {
-        if let Some(t) = topic_after(q, "donde esta ubicada") {
-            return fmt_ubicacion(&t, "esta", v);
+        if let Some(t) = topic_subject(&q, &key_orig, &key_folded, "donde esta ubicada") {
+            return fmt_ubicacion(&t, "está", v);
         }
     }
     if q.contains("donde esta") {
-        if let Some(t) = topic_after(q, "donde esta") {
-            return fmt_ubicacion(&t, "esta", v);
+        if let Some(t) = topic_subject(&q, &key_orig, &key_folded, "donde esta") {
+            return fmt_ubicacion(&t, "está", v);
         }
     }
     if q.contains("capital de") {
-        if let Some(p) = topic_after(q, "capital de") {
+        if let Some(p) = topic_subject(&q, &key_orig, &key_folded, "capital de") {
             return format!("La capital de {} es {}.", p, v);
         }
     }
     if q.contains("ciudad mas poblada") {
-        if let Some(p) = topic_after(q, "mas poblada") {
-            return format!("La ciudad mas poblada de {} es {}.", p, v);
+        if let Some(p) = topic_subject(&q, &key_orig, &key_folded, "mas poblada") {
+            return format!("La ciudad más poblada de {} es {}.", p, v);
         }
     }
     for (m, verbo) in [
-        ("quien escribio", "escribio"),
-        ("quien desarrollo", "desarrollo"),
-        ("quien invento", "invento"),
-        ("quien pinto", "pinto"),
+        ("quien escribio", "escribió"),
+        ("quien desarrollo", "desarrolló"),
+        ("quien invento", "inventó"),
+        ("quien pinto", "pintó"),
     ] {
         if q.contains(m) {
-            if let Some(t) = topic_after(q, m) {
+            if let Some(t) = topic_subject(&q, &key_orig, &key_folded, m) {
                 return format!("{} {} {}.", capitalize_first(v), verbo, t);
             }
         }
@@ -1303,23 +1345,23 @@ fn natural_answer(query: &str, value: &str) -> String {
         } else {
             "quien es"
         };
-        if let Some(t) = topic_after(q, m) {
+        if let Some(t) = topic_subject(&q, &key_orig, &key_folded, m) {
             return format!("{} fue {}.", capitalize_first(&t), v);
         }
     }
     if q.contains("cuando se celebra") {
-        if let Some(t) = topic_after(q, "cuando se celebra") {
+        if let Some(t) = topic_subject(&q, &key_orig, &key_folded, "cuando se celebra") {
             return format!("{} se celebra {}.", capitalize_first(&t), v);
         }
     }
     if q.contains("cuando se usa") {
-        if let Some(t) = topic_after(q, "cuando se usa") {
+        if let Some(t) = topic_subject(&q, &key_orig, &key_folded, "cuando se usa") {
             return format!("{} se usa {}.", capitalize_first(&t), v);
         }
     }
     if q.contains("en que ano") {
-        if let Some(t) = topic_after(q, "en que ano") {
-            return format!("{} en {}.", capitalize_first(&t), v);
+        if let Some(t) = topic_subject(&q, &key_orig, &key_folded, "en que ano") {
+            return format!("{} fue en {}.", capitalize_first(&t), v);
         }
     }
     if q.contains("cuantos") {
@@ -1343,12 +1385,12 @@ fn natural_answer(query: &str, value: &str) -> String {
         return format!("Se {} {}.", verb, v);
     }
     if q.contains("cual es") {
-        if let Some(t) = topic_after(q, "cual es") {
+        if let Some(t) = topic_subject(&q, &key_orig, &key_folded, "cual es") {
             return format!("{} es {}.", capitalize_first(&t), v);
         }
     }
     if q.contains("que es ") || q.ends_with("que es") {
-        if let Some(t) = topic_after(q, "que es") {
+        if let Some(t) = topic_subject(&q, &key_orig, &key_folded, "que es") {
             return format!("{} es {}.", capitalize_first(&t), v);
         }
     }
