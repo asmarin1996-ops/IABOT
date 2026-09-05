@@ -528,6 +528,14 @@ impl SynapseMind {
         use std::io::Write;
         use std::net::TcpStream;
 
+        const MIN_AVAILABLE_MB: u64 = 400;
+        if let Some(avail) = free_memory_mb() {
+            if avail < MIN_AVAILABLE_MB {
+                log::debug!("memoria baja ({} MB), cerebro degradado a respuestas aprendidas", avail);
+                return None;
+            }
+        }
+
         let clipped: String = prompt.chars().take(600).collect();
         let body = serde_json::json!({
             "model": "qwen",
@@ -1300,6 +1308,20 @@ fn query_without_wake(msg: &str, wake: &str) -> String {
         .filter(|t| !t.eq_ignore_ascii_case(w))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn free_memory_mb() -> Option<u64> {
+    if std::env::consts::OS != "linux" {
+        return None;
+    }
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in info.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.trim().parse().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
 }
 
 fn capitalize_first(s: &str) -> String {
