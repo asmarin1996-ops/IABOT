@@ -54,6 +54,9 @@ struct SynapseMind {
     oido: Oido,
     last_vision_at: std::time::Instant,
     last_audio_at: std::time::Instant,
+    last_motor_izq: f64,
+    last_motor_der: f64,
+    last_cabeza: f64,
     memory_db: MemoryDatabase,
     agent_state: AgentState,
     episode: u64,
@@ -240,6 +243,9 @@ impl SynapseMind {
             oido,
             last_vision_at: hace_rato,
             last_audio_at: hace_rato,
+            last_motor_izq: 0.0,
+            last_motor_der: 0.0,
+            last_cabeza: 90.0,
             memory_db,
             agent_state: AgentState::new(),
             episode: 0,
@@ -437,6 +443,9 @@ impl SynapseMind {
             .execute_all(ActuatorCommand::Custom("motor_der".to_string(), vec![der]));
         self.actuators
             .execute_all(ActuatorCommand::Custom("servo_cabezal".to_string(), vec![cabeza]));
+        self.last_motor_izq = izq;
+        self.last_motor_der = der;
+        self.last_cabeza = cabeza;
         self.robot.execute_action(action, &mut self.world);
     }
 
@@ -593,6 +602,12 @@ impl SynapseMind {
                         match a.execute(ActuatorCommand::Custom(name.clone(), vec![angle])) {
                             Ok(()) => moved = true,
                             Err(e) => log::warn!("actuador '{}': {}", nm, e),
+                        }
+                        match nm.as_str() {
+                            "motor_izq" => self.last_motor_izq = angle,
+                            "motor_der" => self.last_motor_der = angle,
+                            "servo_cabezal" => self.last_cabeza = angle,
+                            _ => {}
                         }
                     }
                 }
@@ -1016,7 +1031,7 @@ impl SynapseMind {
         };
 
         format!(
-            "{{\"nombre\":\"{}\",\"activacion\":\"{}\",\"emocion\":\"{}\",\"emoji\":\"{}\",\"confianza\":{},\"estres\":{},\"energia\":{},\"curiosidad\":{},\"explotacion\":{},\"explotar\":{},\"episodio\":{},\"total_metas\":{},\"posicion\":\"({}, {})\",\"estados\":{},\"experiencias\":{},\"adaptaciones\":{},\"recompensa\":{},\"mundo\":\"{}\",\"sensores\":{},\"mensaje\":\"{}\"}}",
+            "{{\"nombre\":\"{}\",\"activacion\":\"{}\",\"emocion\":\"{}\",\"emoji\":\"{}\",\"confianza\":{},\"estres\":{},\"energia\":{},\"curiosidad\":{},\"explotacion\":{},\"explotar\":{},\"episodio\":{},\"total_metas\":{},\"posicion\":\"({}, {})\",\"estados\":{},\"experiencias\":{},\"adaptaciones\":{},\"recompensa\":{},\"mundo\":\"{}\",\"sensores\":{},\"vista_brillo\":{},\"vista_movimiento\":{},\"vista_texto\":\"{}\",\"oido_nivel\":{},\"oido_voz\":{},\"oido_texto\":\"{}\",\"motor_izq\":{},\"motor_der\":{},\"servo_cabezal\":{},\"mensaje\":\"{}\"}}",
             self.name,
             self.wake_word,
             self.emotion.dominant_emotion(),
@@ -1037,6 +1052,15 @@ impl SynapseMind {
             self.learning.total_reward,
             Self::json_escape_multi(&AsciiRenderer::render_world(&self.world)),
             sensor_map,
+            self.vista.brillo,
+            self.vista.movimiento,
+            Self::json_escape_multi(&self.vista.texto),
+            self.oido.nivel,
+            self.oido.voz,
+            Self::json_escape_multi(&self.oido.texto),
+            self.last_motor_izq,
+            self.last_motor_der,
+            self.last_cabeza,
             Self::json_escape_multi(&self.last_message),
         )
     }

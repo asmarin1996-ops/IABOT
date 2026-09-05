@@ -775,6 +775,8 @@ const DASHBOARD_HTML: &str = r###"
   <div class="side-brand">SYNAPSE AI</div>
   <button class="tab act" onclick="showTab('sec_monitoreo', this)">MONITOREO</button>
   <button class="tab" onclick="showTab('sec_ordenes', this)">ORDENES</button>
+  <button class="tab" onclick="showTab('sec_cuerpo', this)">CUERPO</button>
+  <button class="tab" onclick="showTab('sec_percepcion', this)">PERCEPCION</button>
   <button class="tab" onclick="showTab('sec_conocimiento', this)">CONOCIMIENTO</button>
   <button class="tab" onclick="showTab('sec_reglas', this)">REGLAS</button>
   <button class="tab" onclick="showTab('sec_config', this)">CONFIGURACION</button>
@@ -830,6 +832,60 @@ const DASHBOARD_HTML: &str = r###"
         <input id="train_n" type="number" value="50" min="1" style="width:70px" placeholder="n">
         <button onclick="cmdText('entrenar '+document.getElementById('train_n').value)">Entrenar</button>
       </div>
+    </div>
+  </div>
+</section>
+
+<section id="sec_cuerpo" class="sec" hidden>
+  <div class="grid">
+    <div class="panel">
+      <h1 style="font-size:14px">CUERPO (actuadores)</h1>
+      <table>
+        <tr><td>Motor izquierdo</td><td><b id="body_motor_izq">-</b></td></tr>
+        <tr><td>Motor derecho</td><td><b id="body_motor_der">-</b></td></tr>
+        <tr><td>Servo cuello</td><td><b id="body_servo">-</b></td></tr>
+      </table>
+      <div style="margin-top:12px">
+        <label>Angulo del cuello: <b id="cabeza_val">90</b> grados</label>
+        <input type="range" id="cabeza_slider" min="0" max="180" value="90"
+               oninput="document.getElementById('cabeza_val').textContent=this.value" style="width:100%">
+        <div style="margin-top:6px">
+          <button class="act" onclick="cmdText('mueve cabeza a '+document.getElementById('cabeza_slider').value)">Mover cuello</button>
+        </div>
+      </div>
+      <div style="margin-top:12px">
+        <button onclick="cmd('adelante')">Adelante</button>
+        <button onclick="cmd('atras')">Atras</button>
+        <button onclick="cmd('izquierda')">Izquierda</button>
+        <button onclick="cmd('derecha')">Derecha</button>
+        <button onclick="cmd('stop')">Stop</button>
+        <button class="act" onclick="cmd('pausa')">Pausa</button>
+        <button class="act" onclick="cmd('reanudar')">Reanudar</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="sec_percepcion" class="sec" hidden>
+  <div class="grid">
+    <div class="panel">
+      <h1 style="font-size:14px">VISION (ver)</h1>
+      <button class="act" onclick="cmd('que ves')">Ver ahora</button>
+      <div style="margin-top:12px">
+        <div class="sensorrow"><span>Brillo</span><div class="barw"><div class="barf" id="vista_brillo_bar"></div></div><span id="vista_brillo">-</span></div>
+        <div class="sensorrow"><span>Movimiento</span><div class="barw"><div class="barf" id="vista_mov_bar"></div></div><span id="vista_mov">-</span></div>
+      </div>
+      <div id="vista_texto" style="margin-top:8px;font-size:12px;color:#8b949e">Todavia no he mirado.</div>
+    </div>
+
+    <div class="panel">
+      <h1 style="font-size:14px">AUDICION (escuchar)</h1>
+      <button class="act" onclick="cmd('escucha')">Escuchar ahora</button>
+      <div style="margin-top:12px">
+        <div class="sensorrow"><span>Nivel sonido</span><div class="barw"><div class="barf" id="oido_nivel_bar"></div></div><span id="oido_nivel">-</span></div>
+        <div class="sensorrow"><span>Voz detectada</span><span id="oido_voz">-</span></div>
+      </div>
+      <div id="oido_texto" style="margin-top:8px;font-size:12px;color:#8b949e">Todavia no he escuchado.</div>
     </div>
   </div>
 </section>
@@ -1041,7 +1097,7 @@ async function refresh(){
     document.getElementById('confianza').textContent = d.confianza+'%';
     document.getElementById('estres').textContent = d.estres+'%';
     document.getElementById('energia').textContent = d.energia+'%';
-    document.getElementById('exploracion').textContent = d.exploracion+'%';
+    document.getElementById('exploracion').textContent = (d.explotacion*100).toFixed(0)+'%';
     document.getElementById('emoji').textContent = d.emoji;
     document.getElementById('episodio').textContent = d.episodio;
     document.getElementById('total_metas').textContent = d.total_metas;
@@ -1055,6 +1111,35 @@ async function refresh(){
     let sh='';
     for(const k in d.sensores){ const v=d.sensores[k]; sh+='<div class="sensorrow"><span>'+k+'</span><div class="barw"><div class="barf" style="width:'+(v*100)+'%"></div></div><span>'+Math.round(v*100)+'%</span></div>'; }
     document.getElementById('sensores').innerHTML = sh;
+    // cuerpo (actuadores)
+    if(d.motor_izq!=null){ document.getElementById('body_motor_izq').textContent = (d.motor_izq>0?'+':'')+d.motor_izq.toFixed(2); }
+    if(d.motor_der!=null){ document.getElementById('body_motor_der').textContent = (d.motor_der>0?'+':'')+d.motor_der.toFixed(2); }
+    if(d.servo_cabezal!=null){
+      const cab = Math.round(d.servo_cabezal);
+      document.getElementById('body_servo').textContent = cab+'°';
+      const sl = document.getElementById('cabeza_slider');
+      if(document.activeElement !== sl){ sl.value = cab; document.getElementById('cabeza_val').textContent = cab; }
+    }
+    // percepcion: vision
+    if(d.vista_brillo!=null){
+      const vb = Math.round(d.vista_brillo*100);
+      document.getElementById('vista_brillo').textContent = vb+'%';
+      document.getElementById('vista_brillo_bar').style.width = (d.vista_brillo*100)+'%';
+    }
+    if(d.vista_movimiento!=null){
+      const vm = Math.round(d.vista_movimiento*100);
+      document.getElementById('vista_mov').textContent = vm+'%';
+      document.getElementById('vista_mov_bar').style.width = (d.vista_movimiento*100)+'%';
+    }
+    if(d.vista_texto){ document.getElementById('vista_texto').textContent = d.vista_texto; }
+    // percepcion: audicion
+    if(d.oido_nivel!=null){
+      const on = Math.round(d.oido_nivel*100);
+      document.getElementById('oido_nivel').textContent = on+'%';
+      document.getElementById('oido_nivel_bar').style.width = (d.oido_nivel*100)+'%';
+    }
+    if(d.oido_voz!=null){ document.getElementById('oido_voz').textContent = d.oido_voz ? 'SI' : 'no'; }
+    if(d.oido_texto){ document.getElementById('oido_texto').textContent = d.oido_texto; }
     // mensaje del robot
     if(d.mensaje && d.mensaje.length){
       log(d.mensaje);
