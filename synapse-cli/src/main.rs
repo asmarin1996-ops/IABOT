@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 use std::io::{self, Write};
+use std::collections::HashMap;
 
 mod commands;
 mod voice;
@@ -24,6 +25,14 @@ use synapse_sim::world::World;
 use synapse_sim::robot::VirtualRobot;
 use synapse_sim::renderer::AsciiRenderer;
 
+struct MemEntry {
+    key: String,
+    value: String,
+    cat: String,
+    source: String,
+    tokens: Vec<String>,
+}
+
 struct SynapseMind {
     brain: Brain,
     learning: LearningEngine,
@@ -40,6 +49,8 @@ struct SynapseMind {
     total_goals: u64,
     name: String,
     wake_word: String,
+    knowledge: Vec<MemEntry>,
+    token_index: HashMap<String, Vec<usize>>,
     paused: bool,
     last_message: String,
     last_wake_at: std::time::Instant,
@@ -84,6 +95,63 @@ impl SynapseMind {
             None => "synapse".to_string(),
         };
 
+        // Migrar conocimiento legado (config "learned_phrases") a la tabla knowledge
+        if let Some(legacy) = memory_db.get_config("learned_phrases")? {
+            if !legacy.trim().is_empty() {
+                for entry in legacy.split(";;") {
+                    let mut parts = entry.splitn(2, '|');
+                    let ph = parts.next().unwrap_or("").trim();
+                    let me = parts.next().unwrap_or("").trim();
+                    if !ph.is_empty() {
+                        let norm = normalize_key(ph);
+                        if !norm.is_empty() {
+                            let _ = memory_db.store_knowledge(&norm, me, Some("hecho"), Some("chat"));
+                        }
+                    }
+                }
+            }
+            let _ = memory_db.delete_config("learned_phrases");
+        }
+
+        // Re-etiquetar frases de material como categoria "material" con su documento
+        if let Ok(Some(material)) = memory_db.get_config("learned_material") {
+            let mut cur_doc = String::new();
+            for line in material.lines() {
+                let t = line.trim();
+                if t.starts_with('[') && t.ends_with(']') && t.len() > 2 {
+                    cur_doc = t[1..t.len() - 1].to_string();
+                    continue;
+                }
+                if t.is_empty() {
+                    continue;
+                }
+                for sentence in split_sentences(t) {
+                    let words: Vec<&str> = sentence.split_whitespace().collect();
+                    if words.len() < 4 {
+                        continue;
+                    }
+                    let norm = normalize_key(&words[..4].join(" "));
+                    let _ = memory_db.store_knowledge(
+                        &norm,
+                        sentence.trim(),
+                        Some("material"),
+                        Some(&cur_doc),
+                    );
+                }
+            }
+        }
+
+        let knowledge = load_knowledge(&memory_db);
+        let mut token_index: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, e) in knowledge.iter().enumerate() {
+            if e.tokens.is_empty() {
+                continue;
+            }
+            for t in &e.tokens {
+                token_index.entry(t.clone()).or_default().push(i);
+            }
+        }
+
         Ok(Self {
             brain: Brain::new(8, 4),
             learning: LearningEngine::new(),
@@ -100,6 +168,8 @@ impl SynapseMind {
             total_goals: 0,
             name,
             wake_word,
+            knowledge,
+            token_index,
             paused: false,
             last_message: "Listo para aprender.".to_string(),
             last_wake_at: std::time::Instant::now(),
@@ -327,6 +397,14 @@ impl SynapseMind {
                 self.set_wake_word(v.as_str());
                 return format!("Palabra de activacion cambiada a '{}'", self.wake_word);
             }
+            WebCommand::Learn(phrase, meaning) => {
+                let added = self.learn_phrase(&phrase, &meaning);
+                if added {
+                    format!("He aprendido que {}", meaning)
+                } else {
+                    "Ya se eso.".to_string()
+                }
+            }
             WebCommand::DoStatus => {
                 return format!(
                     "Episodio {}, metas {}, posicion {:?}, emocion {}",
@@ -347,8 +425,51 @@ impl SynapseMind {
                     "Puedes decirme: adelante, atras, izquierda, derecha, stop, pausa, reanudar, estado, diagnostico, entrenar <n>, nombre <x>, activacion <x>"
                 );
             }
+            WebCommand::DoKnowledge => {
+                let facts: Vec<&MemEntry> = self.knowledge.iter().filter(|e| e.cat != "material").collect();
+                let mats: Vec<&MemEntry> = self.knowledge.iter().filter(|e| e.cat == "material").collect();
+                if facts.is_empty() && mats.is_empty() {
+                    return "Todavia no he aprendido nada. Dime: aprende que X es Y, o sube un PDF.".to_string();
+                }
+                let mut out = String::new();
+                if !facts.is_empty() {
+                    out.push_str(&format!("Se {} cosas: ", facts.len()));
+                    for (i, e) in facts.iter().take(12).enumerate() {
+                        let k = e.key.split_whitespace().take(6).collect::<Vec<_>>().join(" ");
+                        out.push_str(&format!("({}) {}; ", i + 1, k));
+                    }
+                }
+                if !mats.is_empty() {
+                    let mut docs: Vec<String> = Vec::new();
+                    for e in &mats {
+                        if !e.source.is_empty() && !docs.contains(&e.source) {
+                            docs.push(e.source.clone());
+                        }
+                    }
+                    out.push_str(&format!(
+                        " Y tengo material de {} documento(s): {}.",
+                        docs.len(),
+                        if docs.is_empty() { "sin nombre".to_string() } else { docs.join(", ") }
+                    ));
+                }
+                out
+            }
             WebCommand::Unknown => {
-                return "No entiendo esa orden. Escribe 'ayuda' para ver las opciones.".to_string();
+                match self.retrieve(msg) {
+                    Some(e) if e.cat == "material" => {
+                        let src = if e.source.is_empty() {
+                            "el PDF".to_string()
+                        } else {
+                            e.source.clone()
+                        };
+                        format!("Del documento {}, recuerdo: {}", src, e.value)
+                    }
+                    Some(e) => e.value.clone(),
+                    None => {
+                        "Aun no tengo informacion sobre eso. Ensename con 'aprende que X es Y' o sube un PDF."
+                            .to_string()
+                    }
+                }
             }
         }
     }
@@ -362,6 +483,129 @@ impl SynapseMind {
         let clean = value.trim().split_whitespace().next().unwrap_or_default();
         self.wake_word = clean.to_string();
         let _ = self.memory_db.set_config("activacion", clean);
+    }
+
+    fn learn_phrase(&mut self, phrase: &str, meaning: &str) -> bool {
+        let clean_p: String = phrase
+            .trim()
+            .replace('|', " ")
+            .replace(';', " ")
+            .chars()
+            .map(|c| if c == '\n' { ' ' } else { c })
+            .collect();
+        let clean_m: String = meaning
+            .trim()
+            .replace('|', " ")
+            .replace(';', " ")
+            .chars()
+            .map(|c| if c == '\n' { ' ' } else { c })
+            .collect();
+        if clean_p.is_empty() || clean_m.is_empty() {
+            return false;
+        }
+        self.add_knowledge(&clean_p, &clean_m, "hecho", "chat")
+    }
+
+    fn add_knowledge(&mut self, key: &str, value: &str, cat: &str, source: &str) -> bool {
+        let norm = normalize_key(key);
+        if norm.is_empty() || value.trim().is_empty() {
+            return false;
+        }
+        let key_tokens = tokenize(key);
+        if self
+            .knowledge
+            .iter()
+            .any(|e| e.tokens == key_tokens || e.key.eq_ignore_ascii_case(key))
+        {
+            return false;
+        }
+        let _ = self
+            .memory_db
+            .store_knowledge(&norm, value.trim(), Some(cat), Some(source));
+        let mut entry = MemEntry {
+            key: key.trim().to_string(),
+            value: value.trim().to_string(),
+            cat: cat.to_string(),
+            source: source.to_string(),
+            tokens: tokenize(key),
+        };
+        let idx = self.knowledge.len();
+        if entry.tokens.is_empty() {
+            entry.tokens = tokenize(&norm);
+        }
+        self.knowledge.push(entry);
+        for t in self.knowledge[idx].tokens.clone() {
+            self.token_index
+                .entry(t)
+                .or_insert_with(Vec::new)
+                .push(idx);
+        }
+        true
+    }
+
+    fn retrieve(&self, query: &str) -> Option<&MemEntry> {
+        let q_tokens = tokenize(query);
+        if q_tokens.is_empty() {
+            return None;
+        }
+        let mut best: Option<(i64, usize)> = None;
+        for (i, e) in self.knowledge.iter().enumerate() {
+            let tokens_lower: Vec<String> = e.tokens.iter().map(|t| t.to_lowercase()).collect();
+            let mut match_count = 0usize;
+            let mut seq_hint = false;
+            for qt in &q_tokens {
+                let ql = qt.to_lowercase();
+                if tokens_lower.contains(&ql) {
+                    match_count += 1;
+                }
+            }
+            for w in tokens_lower.windows(2) {
+                let ql: Vec<String> = q_tokens.iter().map(|t| t.to_lowercase()).collect();
+                if ql.windows(2).any(|p| p == w) {
+                    seq_hint = true;
+                }
+            }
+            let seq_bonus: i64 = if seq_hint { 8 } else { 0 };
+            if match_count < 2 {
+                continue;
+            }
+            let cat_bias: i64 = if e.cat == "material" { 2 } else { 0 };
+            let score = (match_count as i64) * 10 + cat_bias + seq_bonus;
+            if score > 0 && (best.is_none() || score > best.unwrap().0) {
+                best = Some((score, i));
+            }
+        }
+        best.map(|(_, i)| &self.knowledge[i])
+    }
+
+    fn learn_material(&mut self, name: &str, text: &str) -> usize {
+        let mut material = self.memory_db.get_config("learned_material").unwrap_or_default().unwrap_or_default();
+        material.push_str(&format!("\n[{}]\n{}\n", name, text));
+        if material.len() > 200_000 {
+            material = material.chars().take(200_000).collect();
+        }
+        let _ = self.memory_db.set_config("learned_material", &material);
+
+        let mut added = 0;
+        for sentence in split_sentences(text) {
+            if added >= 30 {
+                break;
+            }
+            let words: Vec<&str> = sentence.split_whitespace().collect();
+            if words.len() < 4 {
+                continue;
+            }
+            let key: String = words[..4].join(" ");
+            let phrase = if key.len() > 60 {
+                key.chars().take(60).collect()
+            } else {
+                key
+            };
+            if self.add_knowledge(&phrase, &sentence, "material", name) {
+                added += 1;
+            }
+        }
+        added
     }
 
     fn status_json(&self) -> String {
@@ -606,6 +850,30 @@ impl SynapseMind {
                 self.speak_response(&hub, &voice_holder, &next.unwrap());
             }
 
+            loop {
+                let next = hub.lock().unwrap().learn_requests.pop_front();
+                if next.is_none() {
+                    break;
+                }
+                let (phrase, meaning) = next.unwrap();
+                self.learn_phrase(&phrase, &meaning);
+                let response = format!("He aprendido que {} es {}", phrase, meaning);
+                self.last_message = response.clone();
+                self.speak_response(&hub, &voice_holder, &response);
+            }
+
+            loop {
+                let next = hub.lock().unwrap().pdf_requests.pop_front();
+                if next.is_none() {
+                    break;
+                }
+                let (name, text) = next.unwrap();
+                let added = self.learn_material(&name, &text);
+                let response = format!("He leido el material {} y aprendi {} frases.", name, added);
+                self.last_message = response.clone();
+                self.speak_response(&hub, &voice_holder, &response);
+            }
+
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
@@ -652,7 +920,100 @@ impl SynapseMind {
         guard.name = self.name.to_string();
         guard.wake_word = self.wake_word.to_string();
         guard.status = status;
+        guard.learned_summary = self
+            .knowledge
+            .iter()
+            .take(30)
+            .map(|e| format!("{} = {}", e.key, e.value))
+            .collect::<Vec<_>>()
+            .join("; ");
     }
+}
+
+fn normalize_key(key: &str) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+    for c in key.chars() {
+        let lc = c.to_lowercase().next().unwrap_or(c);
+        let folded = match lc {
+            'á' => 'a',
+            'é' => 'e',
+            'í' => 'i',
+            'ó' => 'o',
+            'ú' => 'u',
+            'ü' => 'u',
+            'ñ' => 'n',
+            _ => lc,
+        };
+        if folded.is_ascii_alphanumeric() {
+            out.push(folded);
+            last_space = false;
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+fn tokenize(text: &str) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "que", "los", "las", "del", "una", "un", "con", "por", "para", "pero", "mas", "mas",
+        "muy", "sus", "cuando", "donde", "cual", "quien", "como", "desde", "hacia", "aunque",
+        "entre", "eso", "esto", "era", "todo", "nada", "mucho", "uno", "ese", "son", "esta",
+        "este", "esa", "el", "la", "de", "es", "me", "se", "y", "a", "o", "e", "su", "en", "al",
+        "fue", "tiempo", "dia", "dia",
+    ];
+    normalize_key(text)
+        .split_whitespace()
+        .map(|t| t.to_string())
+        .filter(|t| t.len() >= 3 && !STOP.contains(&t.as_str()))
+        .collect()
+}
+
+fn load_knowledge(db: &MemoryDatabase) -> Vec<MemEntry> {
+    let rows = match db.all_knowledge() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    rows.into_iter()
+        .map(|row| {
+            let tokens = tokenize(&row.key);
+            MemEntry {
+                key: row.key,
+                value: row.value,
+                cat: row.category.unwrap_or_default(),
+                source: row.source.unwrap_or_default(),
+                tokens,
+            }
+        })
+        .filter(|e| !e.tokens.is_empty())
+        .collect()
+}
+
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in text.chars() {
+        if c == '\u{0}' {
+            continue;
+        }
+        cur.push(c);
+        if matches!(c, '.' | '!' | '?') || c == '\n' {
+            let t = cur.trim().to_string();
+            if t.chars().count() > 8 {
+                out.push(t);
+            }
+            cur.clear();
+        }
+    }
+    if cur.trim().chars().count() > 8 {
+        out.push(cur.trim().to_string());
+    }
+    out
 }
 
 fn print_banner() {

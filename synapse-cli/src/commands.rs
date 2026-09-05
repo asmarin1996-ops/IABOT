@@ -9,6 +9,8 @@ pub enum WebCommand {
     Train(u64),
     SetName(String),
     SetWakeWord(String),
+    Learn(String, String), // phrase, meaning
+    DoKnowledge,
     DoStatus,
     DoDiagnostic,
     Help,
@@ -65,12 +67,51 @@ pub fn parse_web_command(input: &str, wake_word: &str, grace_active: bool) -> We
         return WebCommand::Help;
     }
 
+    // PATRÓN DE APRENDIZAJE (antes que ENTRENAR para no capturarlo como train)
+    if let Some(pos) = text.find("aprende que") {
+        let rest = text[pos + "aprende que".len()..].trim();
+        // Formato: "aprende que X es Y"
+        if let Some(pos_es) = rest.find(" es ") {
+            let phrase = rest[..pos_es].trim();
+            let after_es = rest[pos_es + "es ".len()..].trim();
+            let meaning = if let Some(pos_para) = after_es.find(" para ") {
+                after_es[..pos_para].trim().to_string()
+            } else {
+                after_es.to_string()
+            };
+            if !phrase.is_empty() && !meaning.is_empty() {
+                return WebCommand::Learn(phrase.to_string(), meaning);
+            }
+        }
+    }
+
+    // Also check "remember that"
+    if let Some(pos) = text.find("remember that") {
+        let rest = text[pos + "remember that".len()..].trim();
+        if let Some(pos_is) = rest.find(" is ") {
+            let phrase = rest[..pos_is].trim();
+            let meaning = if let Some(pos_para) = rest[pos_is + "is ".len()..].find(" para ") {
+                rest[pos_is + "is ".len()..pos_is + "is ".len() + pos_para].trim().to_string()
+            } else {
+                rest[pos_is + "is ".len()..].trim().to_string()
+            };
+            if !phrase.is_empty() && !meaning.is_empty() {
+                return WebCommand::Learn(phrase.to_string(), meaning);
+            }
+        }
+    }
+
+    // QUE SABES / CONOCIMIENTO APRENDIDO
+    if contains_any(&text, &["que sabes", "que aprendiste", "que has aprendido", "que sabemos", "que me ensenaste", "que dice el material", "lee el material", "que aprendiste del pdf", "que hay en el pdf"]) {
+        return WebCommand::DoKnowledge;
+    }
+
     // ENTRENAR con numero opcional
     if let Some(n) = detect_number(&text) {
         if contains_any(&text, &["entrenar", "entrena", "train", "aprendizaje", "aprende", "adestrar", "edutacion"]) {
             return WebCommand::Train(n);
         }
-    } else if contains_any(&text, &["entrenar", "entrena", "train", "aprende", "aprendizaje", "adestrar"]) {
+    } else if contains_any(&text, &["entrenar", "entrena", "train", "aprendizaje", "adestrar"]) {
         return WebCommand::Train(50);
     }
 
@@ -84,7 +125,7 @@ pub fn parse_web_command(input: &str, wake_word: &str, grace_active: bool) -> We
         return WebCommand::SetWakeWord(w);
     }
 
-    WebCommand::Unknown
+WebCommand::Unknown
 }
 
 fn detect_action(text: &str) -> Option<Action> {

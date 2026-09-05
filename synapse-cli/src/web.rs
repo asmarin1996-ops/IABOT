@@ -11,6 +11,9 @@ pub struct WebHubData {
     pub voice_name: String,
     pub voices: Vec<String>,
     pub speak_requests: VecDeque<String>,
+    pub learn_requests: VecDeque<(String, String)>,
+    pub pdf_requests: VecDeque<(String, String)>,
+    pub learned_summary: String,
 }
 
 pub type WebHub = Arc<Mutex<WebHubData>>;
@@ -25,6 +28,9 @@ pub fn make_hub(name: &str, wake_word: &str) -> WebHub {
         voice_name: crate::voice::DEFAULT_VOICE.to_string(),
         voices: Vec::new(),
         speak_requests: VecDeque::new(),
+        learn_requests: VecDeque::new(),
+        pdf_requests: VecDeque::new(),
+        learned_summary: String::new(),
     }))
 }
 
@@ -67,6 +73,11 @@ fn handle_connection(stream: mio::net::TcpStream, hub: WebHub) {
 
     if method == "GET" && (path == "/api/speak.wav" || path.starts_with("/api/speak.wav?")) {
         handle_speak_wav(&mut s, path.as_str());
+        return;
+    }
+
+    if method == "GET" && (path == "/api/learn" || path.starts_with("/api/learn?")) {
+        handle_learn_get(&mut s, path.as_str(), hub);
         return;
     }
 
@@ -117,6 +128,33 @@ fn handle_speak_wav(s: &mut mio::net::TcpStream, path: &str) {
     }
 }
 
+fn handle_learn_get(s: &mut mio::net::TcpStream, path: &str, hub: WebHub) {
+    let mut phrase = String::new();
+    let mut meaning = String::new();
+    if let Some(q) = path.split('?').nth(1) {
+        for kv in q.split('&') {
+            let mut it = kv.splitn(2, '=');
+            let key = it.next().unwrap_or("");
+            let val = it.next().unwrap_or("");
+            if key == "phrase" {
+                phrase = percent_decode(val).replace('+', " ");
+            } else if key == "meaning" {
+                meaning = percent_decode(val).replace('+', " ");
+            }
+        }
+    }
+    if phrase.is_empty() || meaning.is_empty() {
+        send_json(s, 400, "{\"error\":\"faltan datos\"}");
+        return;
+    }
+    {
+        let mut guard = hub.lock().unwrap();
+        guard.learn_requests.push_back((phrase.clone(), meaning.clone()));
+    }
+    let resp = format!("{{\"ok\":true,\"aprendido\":\"{}\"}}", json_escape(&phrase));
+    send_json(s, 200, resp.as_str());
+}
+
 fn handle_get_api(s: &mut mio::net::TcpStream, path: &str, hub: WebHub) {
     let guard = hub.lock().unwrap();
     match path {
@@ -134,6 +172,10 @@ fn handle_get_api(s: &mut mio::net::TcpStream, path: &str, hub: WebHub) {
         }
         "/api/voices" => {
             let body = format!("{{\"voces\":[{}]}}", format_voices(&guard.voices));
+            send_json(s, 200, body.as_str());
+        }
+        "/api/learned" => {
+            let body = format!("{{\"aprendido\":\"{}\"}}", json_escape(&guard.learned_summary));
             send_json(s, 200, body.as_str());
         }
         _ => send_json(s, 404, "{\"error\":\"no encontrado\"}"),
@@ -204,6 +246,67 @@ fn handle_write_api(s: &mut mio::net::TcpStream, path: &str, body: &str, hub: We
         return;
     }
 
+    if path == "/api/upload-pdf" {
+        let name = extract_json_string(body, "name").unwrap_or_default();
+        let b64 = extract_json_string(body, "pdf_base64").unwrap_or_default();
+        if name.is_empty() || b64.is_empty() {
+            send_json(s, 400, "{\"error\":\"faltan datos\"}");
+            return;
+        }
+        let pdf_bytes = match base64_decode(&b64) {
+            Some(bytes) if !bytes.is_empty() => bytes,
+            _ => {
+                send_json(s, 400, "{\"error\":\"base64 invalido\"}");
+                return;
+            }
+        };
+        let clean_name: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let folder = pdf_folder();
+        let _ = std::fs::create_dir_all(&folder);
+        let path = format!("{}{}.pdf", folder, clean_name);
+        let _ = std::fs::write(&path, &pdf_bytes);
+        let text = extract_pdf_text(&pdf_bytes);
+        if text.trim().chars().count() < 10 {
+            send_json(
+                s,
+                200,
+                &format!(
+                    "{{\"ok\":true,\"nombre\":\"{}\",\"texto_len\":0,\"msg\":\"no se pudo extraer texto\"}}",
+                    json_escape(&clean_name)
+                ),
+            );
+            return;
+        }
+        guard.pdf_requests.push_back((clean_name.clone(), text.trim().to_string()));
+        send_json(
+            s,
+            200,
+            &format!(
+                "{{\"ok\":true,\"nombre\":\"{}\",\"texto_len\":{}}}",
+                json_escape(&clean_name),
+                text.trim().chars().count()
+            ),
+        );
+        return;
+    }
+
+    if path == "/api/learn" {
+        if let Some(phrase) = extract_json_string(body, "phrase") {
+            if let Some(meaning) = extract_json_string(body, "meaning") {
+                if !phrase.is_empty() && !meaning.is_empty() {
+                    guard.learn_requests.push_back((phrase, meaning));
+                    send_json(s, 200, "{\"ok\":true}");
+                    return;
+                }
+            }
+        }
+        send_json(s, 400, "{\"error\":\"faltan datos\"}");
+        return;
+    }
+
     send_json(s, 404, "{\"error\":\"no encontrado\"}");
 }
 
@@ -233,14 +336,14 @@ fn read_request(s: &mut mio::net::TcpStream) -> String {
 
     loop {
         attempts += 1;
-        if attempts > 1500 {
+        if attempts > 4000 {
             break;
         }
         if need > 0 && buf.len() >= need {
             break;
         }
 
-        let mut chunk = [0u8; 4096];
+        let mut chunk = [0u8; 65536];
         let n = read_some(s, &mut chunk);
 
         match n {
@@ -417,6 +520,177 @@ fn extract_json_bool(body: &str, key: &str) -> Option<bool> {
     None
 }
 
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let mut vals = [255u8; 256];
+    let alphabet: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (i, &c) in alphabet.iter().enumerate() {
+        vals[c as usize] = i as u8;
+    }
+    let bytes = input.trim().as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() / 4 * 3 + 3);
+    let mut buf = [0u8; 4];
+    let mut idx = 0;
+    for &b in bytes {
+        if b == b'\n' || b == b'\r' || b == b' ' {
+            continue;
+        }
+        if b == b'=' {
+            buf[idx] = 0xFF;
+            idx += 1;
+            if idx == 4 {
+                decode_quad(&buf, &mut out);
+                idx = 0;
+            }
+            continue;
+        }
+        let v = vals[b as usize];
+        if v == 255 {
+            return None;
+        }
+        buf[idx] = v;
+        idx += 1;
+        if idx == 4 {
+            decode_quad(&buf, &mut out);
+            idx = 0;
+        }
+    }
+    if idx > 1 {
+        decode_quad(&buf, &mut out);
+    }
+    Some(out)
+}
+
+fn decode_quad(buf: &[u8; 4], out: &mut Vec<u8>) {
+    if buf[0] == 0xFF || buf[1] == 0xFF {
+        return;
+    }
+    out.push((buf[0] << 2) | (buf[1] >> 4));
+    if buf[2] != 0xFF {
+        out.push((buf[1] << 4) | (buf[2] >> 2));
+        if buf[3] != 0xFF {
+            out.push((buf[2] << 6) | buf[3]);
+        }
+    }
+}
+
+fn pdf_folder() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/asilva".to_string());
+    format!("{}/learn/", home)
+}
+
+fn extract_pdf_text(pdf: &[u8]) -> String {
+    if let Ok(mut child) = std::process::Command::new("pdftotext")
+        .arg("-eol")
+        .arg("dos")
+        .arg("-")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        let stdin = child.stdin.take();
+        if let Some(mut si) = stdin {
+            let _ = si.write_all(pdf);
+            drop(si);
+        }
+        if let Ok(output) = child.wait_with_output() {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout).to_string();
+                if text.trim().chars().count() >= 10 {
+                    return text;
+                }
+            }
+        }
+    }
+    naive_pdf_text(pdf)
+}
+
+fn naive_pdf_text(pdf: &[u8]) -> String {
+    let s = String::from_utf8_lossy(pdf);
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    let mut i = 0usize;
+    loop {
+        let Some(rel) = find_sub(&s[i..], "stream") else { break };
+        let mut start = i + rel + "stream".len();
+        if start < bytes.len() && (bytes[start] == b'\r' || bytes[start] == b'\n') {
+            start += 1;
+            if start < bytes.len() && bytes[start - 1] == b'\r' && bytes[start] == b'\n' {
+                start += 1;
+            }
+        }
+        let Some(endrel) = find_sub(&s[start..], "endstream") else { break };
+        let end = start + endrel;
+        let seg = &s[start..end];
+        let mut k = 0usize;
+        while k < seg.len() {
+            if seg.as_bytes()[k] == b'(' {
+                if let Some((text, close)) = read_paren_string(seg, k) {
+                    if !text.trim().is_empty() {
+                        out.push_str(text.trim());
+                        out.push(' ');
+                    }
+                    k = close + 1;
+                    continue;
+                }
+            }
+            k += 1;
+        }
+        i = end + "endstream".len();
+    }
+    out.trim().to_string()
+}
+
+fn read_paren_string(s: &str, open_pos: usize) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    let mut j = open_pos + 1;
+    let mut out = String::new();
+    let mut depth = 0;
+    while j < b.len() {
+        match b[j] {
+            b'\\' => {
+                if j + 1 < b.len() {
+                    match b[j + 1] {
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'(' => out.push('('),
+                        b')' => out.push(')'),
+                        b'\\' => out.push('\\'),
+                        _ => {}
+                    }
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            b'(' => {
+                depth += 1;
+                out.push('(');
+                j += 1;
+            }
+            b')' => {
+                if depth == 0 {
+                    return Some((out, j));
+                }
+                depth -= 1;
+                out.push(')');
+                j += 1;
+            }
+            _ => {
+                out.push(b[j] as char);
+                j += 1;
+            }
+        }
+    }
+    None
+}
+
+fn find_sub(haystack: &str, needle: &str) -> Option<usize> {
+    haystack.find(needle)
+}
+
 const DASHBOARD_HTML: &str = r###"
 
 <!DOCTYPE html>
@@ -515,6 +789,28 @@ const DASHBOARD_HTML: &str = r###"
   </div>
 
   <div class="panel">
+    <h1 style="font-size:14px">ENSEÑANZA</h1>
+    <div style="margin-bottom:6px">
+      <label>Frase a enseñar</label>
+      <input id="learn_phrase" type="text" placeholder="ej: hola">
+    </div>
+    <div style="margin-bottom:6px">
+      <label>Significado</label>
+      <input id="learn_meaning" type="text" placeholder="ej: saludo">
+    </div>
+    <button onclick="learnRobot()">Enseñar al robot</button>
+  </div>
+
+  <div class="panel">
+    <h1 style="font-size:14px">SUBIR PDF (material de estudio)</h1>
+    <div style="margin-bottom:6px">
+      <input id="pdf_file" type="file" accept="application/pdf">
+    </div>
+    <button onclick="uploadPDF()">Enviar PDF al robot</button>
+    <div id="pdf_result" style="font-size:12px;color:var(--ok);margin-top:6px"></div>
+  </div>
+
+  <div class="panel">
     <h1 style="font-size:14px">VOZ (femenina, offline)</h1>
     <div style="margin-bottom:8px">
       <label><input type="checkbox" id="voz_activa" checked onchange="guardarVoz()"> Voz activada</label>
@@ -556,6 +852,45 @@ async function guardarConfig(){
   const body = {name:document.getElementById('cfg_nombre').value, wake_word:document.getElementById('cfg_activacion').value};
   await fetch('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   log('< configuracion guardada');
+}
+async function learnRobot(){
+  const phrase = document.getElementById('learn_phrase').value;
+  const meaning = document.getElementById('learn_meaning').value;
+  if(!phrase || !meaning) return;
+  await fetch('/api/learn', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({phrase, meaning})});
+  log('< frase aprendida');
+  // Limpiar inputs
+  document.getElementById('learn_phrase').value = '';
+  document.getElementById('learn_meaning').value = '';
+}
+async function uploadPDF(){
+  const fi = document.getElementById('pdf_file');
+  const out = document.getElementById('pdf_result');
+  if(!fi.files || !fi.files.length){ out.textContent='Selecciona un PDF.'; return; }
+  const f = fi.files[0];
+  if(f.size > 4*1024*1024){ out.textContent='Maximo 4 MB.'; return; }
+  out.textContent='Leyendo PDF...';
+  try{
+    const buf = await f.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let bin='';
+    const chunk=0x8000;
+    for(let i=0;i<bytes.length;i+=chunk){
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i+chunk));
+    }
+    const b64 = btoa(bin);
+    out.textContent='Enviando ('+(f.size/1024).toFixed(0)+' KB)...';
+    const r = await fetch('/api/upload-pdf', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:f.name, pdf_base64:b64})});
+    const j = await r.json();
+    if(j.ok){
+      out.textContent = j.texto_len>0 ? ('OK: '+j.nombre+' - '+j.texto_len+' caracteres extraidos') : ('Recibido: '+j.nombre+' - '+ (j.msg||'sin texto'));
+      log('< pdf enviado: '+j.nombre);
+    } else {
+      out.textContent = j.error || 'Error al enviar PDF';
+    }
+  }catch(e){
+    out.textContent = 'Error: '+e.message;
+  }
 }
 async function refresh(){
   try{

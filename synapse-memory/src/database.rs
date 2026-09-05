@@ -2,6 +2,14 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::path::Path;
 
+pub struct KnowledgeRow {
+    pub id: i64,
+    pub key: String,
+    pub value: String,
+    pub category: Option<String>,
+    pub source: Option<String>,
+}
+
 pub struct MemoryDatabase {
     conn: Connection,
 }
@@ -71,6 +79,7 @@ impl MemoryDatabase {
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_knowledge_category ON knowledge(category);
             ",
         )?;
         Ok(())
@@ -225,6 +234,39 @@ impl MemoryDatabase {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(rows)
+    }
+
+    pub fn all_knowledge(&self) -> Result<Vec<KnowledgeRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, key, value, category, source FROM knowledge
+             WHERE category IN ('hecho', 'material') ORDER BY id",
+        )?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(KnowledgeRow {
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    value: row.get(2)?,
+                    category: row.get(3)?,
+                    source: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows)
+    }
+
+    pub fn delete_knowledge(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM knowledge WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    pub fn delete_config(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM config WHERE key = ?1", params![key])?;
+        Ok(())
     }
 
     pub fn count_experiences(&self) -> Result<usize> {
