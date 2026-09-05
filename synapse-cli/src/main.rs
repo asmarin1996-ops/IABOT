@@ -62,6 +62,32 @@ struct SynapseMind {
     last_wake_at: std::time::Instant,
 }
 
+/// Registra el "cuerpo" del robot: en una Raspberry Pi usa actuadores reales
+/// (servos via PCA9685/I2C y motores DC via GPIO PWM); en cualquier otra
+/// plataforma usa actuadores virtuales para no romper nada.
+#[cfg(feature = "rpi")]
+fn register_cuerpo(actuators: &mut ActuatorArray) {
+    use synapse_hal::rpi_actuator::{is_raspberry_pi, PiMotor, PiServo};
+    use synapse_hal::virtual_actuator::VirtualActuator;
+    if is_raspberry_pi() {
+        log::info!("cuerpo fisico detectado: servos PCA9685 + motores DC");
+        actuators.add(Box::new(PiServo::new("servo_cabezal", 0, 90.0)));
+        actuators.add(Box::new(PiMotor::new("motor_izq", 12, 20, 21)));
+        actuators.add(Box::new(PiMotor::new("motor_der", 13, 26, 19)));
+    } else {
+        actuators.add(Box::new(VirtualActuator::new("motor_izq")));
+        actuators.add(Box::new(VirtualActuator::new("motor_der")));
+        actuators.add(Box::new(VirtualActuator::new("servo_cabezal")));
+    }
+}
+
+#[cfg(not(feature = "rpi"))]
+fn register_cuerpo(actuators: &mut ActuatorArray) {
+    actuators.add(Box::new(VirtualActuator::new("motor_izq")));
+    actuators.add(Box::new(VirtualActuator::new("motor_der")));
+    actuators.add(Box::new(VirtualActuator::new("servo_cabezal")));
+}
+
 impl SynapseMind {
     fn new() -> Result<Self> {
         let memory_path = PathBuf::from("synapse_memory.db");
@@ -79,9 +105,7 @@ impl SynapseMind {
         sensors.add(Box::new(VirtualSensor::new("temperatura", 0.25)));
 
         let mut actuators = ActuatorArray::new();
-        actuators.add(Box::new(VirtualActuator::new("motor_izq")));
-        actuators.add(Box::new(VirtualActuator::new("motor_der")));
-        actuators.add(Box::new(VirtualActuator::new("servo_cabezal")));
+        register_cuerpo(&mut actuators);
 
         let mut monitor = SelfMonitor::new();
         monitor.register_sensor("ultrasonido_frontal");
@@ -351,18 +375,21 @@ impl SynapseMind {
         features
     }
 
-    fn actuator_cmd_for(action: Action) -> synapse_hal::actuator::ActuatorCommand {
-        match action {
-            Action::Forward => synapse_hal::actuator::ActuatorCommand::MoveForward(0.5),
-            Action::Backward => synapse_hal::actuator::ActuatorCommand::MoveBackward(0.5),
-            Action::TurnLeft => synapse_hal::actuator::ActuatorCommand::TurnLeft(30.0),
-            Action::TurnRight => synapse_hal::actuator::ActuatorCommand::TurnRight(30.0),
-            Action::Stop | Action::Custom(_) => synapse_hal::actuator::ActuatorCommand::Stop,
-        }
-    }
-
     fn apply_action(&mut self, action: Action) {
-        self.actuators.execute_all(Self::actuator_cmd_for(action));
+        use synapse_hal::actuator::ActuatorCommand;
+        let (izq, der, cabeza) = match action {
+            Action::Forward => (1.0, 1.0, 90.0),
+            Action::Backward => (-1.0, -1.0, 90.0),
+            Action::TurnLeft => (-0.4, 1.0, 135.0),
+            Action::TurnRight => (1.0, -0.4, 45.0),
+            Action::Stop | Action::Custom(_) => (0.0, 0.0, 90.0),
+        };
+        self.actuators
+            .execute_all(ActuatorCommand::Custom("motor_izq".to_string(), vec![izq]));
+        self.actuators
+            .execute_all(ActuatorCommand::Custom("motor_der".to_string(), vec![der]));
+        self.actuators
+            .execute_all(ActuatorCommand::Custom("servo_cabezal".to_string(), vec![cabeza]));
         self.robot.execute_action(action, &mut self.world);
     }
 
@@ -486,6 +513,28 @@ impl SynapseMind {
                     "Todavia no se eso y prefiero no inventar. Puedes ensenarme con 'aprende que X es Y' o subir un PDF."
                         .to_string()
                 });
+            }
+            WebCommand::MoveServo(name, angle) => {
+                use synapse_hal::actuator::ActuatorCommand;
+                let mut found = false;
+                let mut moved = false;
+                for a in self.actuators.actuators.iter_mut() {
+                    let nm = a.name().to_string();
+                    if nm == name {
+                        found = true;
+                        match a.execute(ActuatorCommand::Custom(name.clone(), vec![angle])) {
+                            Ok(()) => moved = true,
+                            Err(e) => log::warn!("actuador '{}': {}", nm, e),
+                        }
+                    }
+                }
+                if !found {
+                    return format!("No tengo ningún servo llamado {}.", name);
+                }
+                if !moved {
+                    return format!("El servo {} no está conectado en este momento.", name);
+                }
+                return format!("Moviendo {} a {} grados.", name, angle);
             }
             WebCommand::Unknown => {
                 let query = query_without_wake(msg, &self.wake_word);

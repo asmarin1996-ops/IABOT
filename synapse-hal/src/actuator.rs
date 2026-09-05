@@ -11,7 +11,7 @@ pub enum ActuatorCommand {
     Custom(String, Vec<f64>),
 }
 
-pub trait Actuator: Send + Sync {
+pub trait Actuator {
     fn name(&self) -> &str;
     fn execute(&mut self, command: ActuatorCommand) -> Result<()>;
     fn is_online(&self) -> bool;

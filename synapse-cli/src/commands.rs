@@ -16,6 +16,7 @@ pub enum WebCommand {
     Help,
     Think(String),
     SetBrain(bool),
+    MoveServo(String, f64), // nombre del actuador, angulo en grados
     Unknown,
 }
 
@@ -45,6 +46,21 @@ pub fn parse_web_command(input: &str, wake_word: &str, grace_active: bool) -> We
 
     if is_mention_expr(&detect) {
         return WebCommand::Greeting;
+    }
+
+    // MOVIMIENTO DE UN SERVO POR NOMBRE: "mueve cabeza a 90 grados"
+    // (antes que las ordenes de giro: "mueve motor izquierdo a 1" no debe
+    // interpretarse como girar a la izquierda)
+    let manipula = contains_any(&detect, &["mueve", "mover", "angulo", "punto a", "posicion"]);
+    let mide_grados = contains_any(&detect, &["grados"])
+        && !contains_any(&detect, &["gira", "girar", "vira", "giro", "dobla", "ve a la izquierda", "ve a la derecha"]);
+    let habla_del_robot = detect.contains("robot") || detect.contains("movete");
+    if (manipula || mide_grados) && !habla_del_robot {
+        if let Some(servo) = detect_servo(&detect) {
+            if let Some(ang) = detect_number(&detect) {
+                return WebCommand::MoveServo(servo.to_string(), ang as f64);
+            }
+        }
     }
 
     // ORDEN DE MOVIMIENTO
@@ -237,6 +253,37 @@ fn detect_name(text: &str) -> Option<String> {
             if !cleaned.is_empty() && is_plain_word(&cleaned) {
                 return Some(first_word(&cleaned));
             }
+        }
+    }
+    None
+}
+
+fn detect_servo(text: &str) -> Option<&'static str> {
+    let names = [
+        ("brazo izquierdo", "servo_brazo_izq"),
+        ("brazo derecho", "servo_brazo_der"),
+        ("pierna izquierda", "servo_pierna_izq"),
+        ("pierna derecha", "servo_pierna_der"),
+        ("motor izquierdo", "motor_izq"),
+        ("motor derecho", "motor_der"),
+        ("brazo_izq", "servo_brazo_izq"),
+        ("brazo_der", "servo_brazo_der"),
+        ("pierna_izq", "servo_pierna_izq"),
+        ("pierna_der", "servo_pierna_der"),
+        ("cabezal", "servo_cabezal"),
+        ("cabeza", "servo_cabezal"),
+        ("cuello", "servo_cabezal"),
+        ("izquierda", "motor_izq"),
+        ("izq", "motor_izq"),
+        ("derecha", "motor_der"),
+        ("der", "motor_der"),
+        ("brazo", "servo_brazo_izq"),
+        ("pierna", "servo_pierna_izq"),
+        ("cola", "servo_cola"),
+    ];
+    for (word, canonical) in names {
+        if text.contains(word) {
+            return Some(canonical);
         }
     }
     None

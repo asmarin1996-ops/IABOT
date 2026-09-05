@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 description = "CLI interactiva para SynapseAI"
 
+[features]
+default = []
+# Cuerpo fisico: actuadores reales para Raspberry Pi (servos PCA9685 + motores DC)
+rpi = ["synapse-hal/rpi"]
+
 [[bin]]
 name = "synapse"
 path = "src/main.rs"

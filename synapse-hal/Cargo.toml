@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 description = "Hardware Abstraction Layer para SynapseAI"
 
+[features]
+default = []
+# Actuadores fisicos para Raspberry Pi (servos via PCA9685/I2C y motores DC via GPIO PWM)
+rpi = ["dep:rppal"]
+
 [dependencies]
 synapse-core = { path = "../synapse-core" }
 serde.workspace = true
@@ -12,3 +17,4 @@ chrono.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 log.workspace = true
+rppal = { version = "0.19", optional = true }
