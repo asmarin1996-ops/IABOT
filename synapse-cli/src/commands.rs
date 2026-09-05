@@ -14,6 +14,8 @@ pub enum WebCommand {
     DoStatus,
     DoDiagnostic,
     Help,
+    Think(String),
+    SetBrain(bool),
     Unknown,
 }
 
@@ -117,6 +119,34 @@ pub fn parse_web_command(input: &str, wake_word: &str, grace_active: bool) -> We
         return WebCommand::DoKnowledge;
     }
 
+    // CEREBRO (LLM) ON/OFF
+    if contains_any(&detect, &["cerebro on", "cerebro activo", "activa el cerebro", "activa llm"]) {
+        return WebCommand::SetBrain(true);
+    }
+    if contains_any(&detect, &["cerebro off", "cerebro apagado", "desactiva el cerebro", "desactiva llm"]) {
+        return WebCommand::SetBrain(false);
+    }
+
+    // CONVERSACION LIBRE / REFLEXION VIA LLM
+    if contains_any(
+        &detect,
+        &[
+            "piensa que",
+            "en que piensas",
+            "que piensas de",
+            "que piensas",
+            "conversemos",
+            "conversa",
+            "conversar",
+            "hablemos",
+            "hablame de",
+            "charlar",
+            "dime algo",
+        ],
+    ) {
+        return WebCommand::Think(text.clone());
+    }
+
     // ENTRENAR con numero opcional
     if let Some(n) = detect_number(&detect) {
         if contains_any(&detect, &["entrenar", "entrena", "train", "aprendizaje", "aprende", "adestrar", "edutacion"]) {
@@ -144,10 +174,15 @@ fn detect_action(text: &str) -> Option<Action> {
     let backward = ["atras", "reversa", "retrocede", "retroceder", "hacia atras", "pa atras", "para atras", "retrocede un poco", "backward", "move back", "go back", "reversa lenta", "echate para atras", "vuelve"];
     let left = ["izquierda", "izq", "a la izquierda", "gira a la izquierda", "torce a la izquierda", "vira a la izquierda", "da vuelta a la izquierda", "left", "turn left", "go left", "rota izquierda"];
     let right = ["derecha", "der", "a la derecha", "gira a la derecha", "torce a la derecha", "vira a la derecha", "da vuelta a la derecha", "right", "turn right", "go right", "rota derecha"];
-    let stop = ["stop", "para", "parar", "alto", "frenar", "frena", "detente", "detener", "quiero que pares", "por favor para"];
+    let stop = ["stop", "para", "parar", "alto", "frenar", "frena", "detente", "detener", "detenerte", "quiero que pares", "para ya", "por favor para", "frena ya", "para de moverte"];
 
     // Primero las acciones mas restringidas para evitar falsos positivos
-    if contains_any(text, &stop) {
+    let short_cmd = text.split_whitespace().count() <= 4;
+    if stop
+        .iter()
+        .any(|w| w.split_whitespace().count() > 1 && text.contains(w))
+        || (short_cmd && stop.iter().any(|w| w.split_whitespace().count() == 1 && has_word(text, w)))
+    {
         return Some(Action::Stop);
     }
     if contains_any(text, &left) {

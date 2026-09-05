@@ -473,6 +473,20 @@ impl SynapseMind {
                 }
                 out
             }
+            WebCommand::SetBrain(v) => {
+                let _ = self.memory_db.set_config("llm", if v { "1" } else { "0" });
+                return if v {
+                    "Cerebro activado: ahora pienso con mi modelo de lenguaje.".to_string()
+                } else {
+                    "Cerebro desactivado: vuelvo a responder solo con lo que he aprendido.".to_string()
+                };
+            }
+            WebCommand::Think(text) => {
+                return self.ask_llm(&text).unwrap_or_else(|| {
+                    "Todavia no se eso y prefiero no inventar. Puedes ensenarme con 'aprende que X es Y' o subir un PDF."
+                        .to_string()
+                });
+            }
             WebCommand::Unknown => {
                 let query = query_without_wake(msg, &self.wake_word);
                 match self.retrieve(&query) {
@@ -486,12 +500,75 @@ impl SynapseMind {
                     }
                     Some(e) => natural_answer(&normalize_key(&query), &e.key, &e.value),
                     None => {
+                        if self.llm_enabled() {
+                            if let Some(ai) = self.ask_llm(&query) {
+                                return ai;
+                            }
+                        }
                         "Todavia no se eso y prefiero no inventar. Puedes ensenarme con 'aprende que X es Y' o subir un PDF."
                             .to_string()
                     }
                 }
             }
         }
+    }
+
+    fn llm_enabled(&self) -> bool {
+        match self.memory_db.get_config("llm") {
+            Ok(Some(v)) => {
+                let v = v.trim().to_lowercase();
+                v != "0" && v != "off" && v != "no" && v != "false"
+            }
+            _ => true,
+        }
+    }
+
+    fn ask_llm(&self, prompt: &str) -> Option<String> {
+        use std::io::Read;
+        use std::io::Write;
+        use std::net::TcpStream;
+
+        let clipped: String = prompt.chars().take(600).collect();
+        let body = serde_json::json!({
+            "model": "qwen",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Eres susana, una asistente amigable y honesta que responde en espanol de forma breve y natural. Si no sabes algo, dilo sin inventar."
+                },
+                { "role": "user", "content": clipped }
+            ],
+            "max_tokens": 200,
+            "temperature": 0.7
+        });
+        let payload = serde_json::to_string(&body).ok()?;
+        let mut sock = TcpStream::connect(("127.0.0.1", 9091)).ok()?;
+        let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(90)));
+        let req = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:9091\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            payload.len(),
+            payload
+        );
+        sock.write_all(req.as_bytes()).ok()?;
+        let mut raw = Vec::new();
+        sock.read_to_end(&mut raw).ok()?;
+        let text = String::from_utf8_lossy(&raw);
+        let body_str = match text.find("\r\n\r\n") {
+            Some(i) => &text[i + 4..],
+            None => return None,
+        };
+        let v: serde_json::Value = serde_json::from_str(body_str).ok()?;
+        let content = v["choices"][0]["message"]["content"].as_str()?.trim();
+        if content.is_empty() {
+            return None;
+        }
+        let cleaned = content
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        Some(cleaned)
     }
 
     fn set_name(&mut self, value: &str) {
